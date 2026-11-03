@@ -22,7 +22,12 @@ import {
   repairWorkspace,
   type RepairFunction,
   type RepairContext,
+  type RepairResult,
 } from "@/lib/agent/repairLoop";
+import {
+  MetaResponsesClient,
+  executeResponsesRepair,
+} from "@/lib/agent/metaResponsesClient";
 import {
   enforceRouteRateLimit,
   defaultConcurrencyLimiter,
@@ -229,6 +234,7 @@ export function createModelRouterRepairFunction(options: {
 
 export interface AgentRouteDependencies {
   repairFn?: RepairFunction;
+  responsesClient?: MetaResponsesClient;
   router?: ModelRouter;
   rateLimiter?: IRateLimiter;
   concurrencyLimiter?: ConcurrencyLimiter;
@@ -428,22 +434,41 @@ export async function handleAgentRequest(
       });
     }
 
-    // Select repair function (injected or default via ModelRouter)
-    const activeRepairFn =
-      dependencies?.repairFn ||
-      createModelRouterRepairFunction({
-        router: dependencies?.router,
+    let repairResult: RepairResult;
+
+    if (dependencies?.repairFn) {
+      // Injected repair function (for mock tests)
+      repairResult = await repairWorkspace(workspace, dependencies.repairFn, {
+        maxAttempts: 2,
+      });
+    } else if (dependencies?.router) {
+      // Injected ModelRouter (for backwards compatibility with router mock tests)
+      const activeRepairFn = createModelRouterRepairFunction({
+        router: dependencies.router,
         provider: providerType,
         model: modelToUse,
         requestId: reqId,
         disableFallback: true,
         concurrencyLimiter: dependencies?.concurrencyLimiter,
       });
+      repairResult = await repairWorkspace(workspace, activeRepairFn, {
+        maxAttempts: 2,
+      });
+    } else {
+      // Production Meta Model API Responses API agent repair workflow
+      const responsesClient =
+        dependencies?.responsesClient || new MetaResponsesClient();
+      const activeConcurrencyLimiter =
+        dependencies?.concurrencyLimiter || defaultConcurrencyLimiter;
 
-    // Execute bounded repair engine
-    const repairResult = await repairWorkspace(workspace, activeRepairFn, {
-      maxAttempts: 2,
-    });
+      repairResult = await activeConcurrencyLimiter.execute(() =>
+        executeResponsesRepair(workspace, responsesClient, {
+          model: modelToUse,
+          requestId: reqId,
+          maxIterations: 3,
+        })
+      );
+    }
 
     if (repairResult.error) {
       throw repairResult.error;
