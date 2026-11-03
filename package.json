@@ -7,7 +7,7 @@
     "build": "next build --webpack",
     "start": "next start",
     "lint": "eslint",
-    "test": "tsx --test src/**/*.test.ts",
+    "test": "tsx --test \"src/**/*.test.ts\"",
     "postinstall": "node scripts/patch-sandpack.mjs && node scripts/copy-sandpack.mjs"
   },
   "dependencies": {
