@@ -1,7 +1,7 @@
 "use client";
 
 import { useState, useRef, useEffect, Component, type ReactNode, type ErrorInfo } from "react";
-import { Sandpack } from "@codesandbox/sandpack-react";
+import { SandpackProvider, SandpackLayout, SandpackPreview } from "@codesandbox/sandpack-react";
 import { MetaEmblem, MetaWordmark } from "./components/MetaEmblem";
 import JSZip from "jszip";
 import {
@@ -1609,11 +1609,11 @@ export default function Home() {
       return (
         <div
           style={{
-            background: "white",
+            background: "#141418",
             borderRadius: "12px",
             padding: "40px 20px",
             textAlign: "center",
-            color: "#6b7280",
+            color: "#9ca3af",
             minHeight: "300px",
             display: "flex",
             alignItems: "center",
@@ -1674,9 +1674,9 @@ createRoot(document.getElementById("root")!).render(
     const currentDeps = dependencies[appType] || {};
 
     return (
-      <div className="w-full min-h-[560px] rounded-xl overflow-hidden bg-[#18181c] border border-[#27272f]">
+      <div className="w-full min-h-[560px] h-full rounded-xl overflow-hidden bg-[#18181c]">
         <PreviewErrorBoundary onRepair={repairApp} isBusy={isBusy}>
-          <Sandpack
+          <SandpackProvider
             key={`${appType}-${mainFile?.name}-${mainFile?.code}-${JSON.stringify(
               currentDeps
             )}`}
@@ -1686,12 +1686,33 @@ createRoot(document.getElementById("root")!).render(
               dependencies: currentDeps,
             }}
             options={{
-              showTabs: false,
-              showNavigator: false,
-              showConsole: true,
               bundlerURL: "/sandpack",
             }}
-          />
+            theme="dark"
+          >
+            <SandpackLayout
+              style={{
+                border: "none",
+                borderRadius: 0,
+                height: "100%",
+                minHeight: "560px",
+                background: "transparent",
+              }}
+            >
+              <SandpackPreview
+                showNavigator={false}
+                showOpenInCodeSandbox={false}
+                showRefreshButton={true}
+                showRestartButton={true}
+                showSandpackErrorOverlay={true}
+                style={{
+                  height: "100%",
+                  minHeight: "560px",
+                  width: "100%",
+                }}
+              />
+            </SandpackLayout>
+          </SandpackProvider>
         </PreviewErrorBoundary>
       </div>
     );
@@ -2362,7 +2383,7 @@ createRoot(document.getElementById("root")!).render(
                       React + TS
                     </span>
                   </div>
-                  <span className="text-[11px] text-[#71717a]">Sandpack Studio</span>
+                  <span className="text-[11px] text-[#71717a]">Live App Preview</span>
                 </div>
 
                 <div className="flex-1 rounded-xl overflow-hidden border border-[#22222a] bg-black">
