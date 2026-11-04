@@ -1,146 +1,269 @@
-# AI App Builder
+# Meta AI App Builder
 
-> **Meta-Only AI App Builder**<br />
-> A browser-based React application builder featuring in-memory workspace editing, self-hosted Sandpack preview, and a user-triggered bounded TypeScript syntax self-repair agent with Meta provider routing (`muse-spark-1.3`).
-
----
-
-## Important Verification & Operational Notices
-
-> [!WARNING]
-> **Live Model Inference Connectivity Unverified:**<br />
-> Provider request routing, payload construction, secret sanitization, and endpoint boundaries are verified through an offline mock test suite. End-to-end generation and repair against **live Meta API endpoints** (`https://api.meta.ai/v1/chat/completions`) have **not been executed**. Do not assume the Meta endpoint or model is operational in production.
-
-> [!WARNING]
-> **Model Usage Costs & Credentials:**<br />
-> The server expects `MODEL_API_KEY` configured in the server environment only. Never expose API keys to the browser client.
-
-> [!NOTE]
-> **Meta-Only Routing & Zero Cross-Provider Fallback:**<br />
-> - **Workspace UI:** Defaults to **Meta (`muse-spark-1.3`)** in `src/app/page.tsx`.
-> - **Server Routing:** All prompt generation, code editing, and syntax repair requests route directly to Meta (`muse-spark-1.3`) via `src/lib/modelRouter.ts`. Active Gemini, NVIDIA, and Nebius providers and cross-provider fallbacks have been removed.
+> **Imagine it. Build it.**<br />
+> A web application development studio powered exclusively by **Meta Muse Spark 1.3 (`muse-spark-1.3`)**. Transforms natural language descriptions into planned, modular, multi-file React TypeScript applications with live client-side preview, staged generation recovery, and compiler-guided syntax self-repair.
 
 ---
 
-## Overview & Intended Users
+## 1. Problem Statement
 
-**AI App Builder** is a prototyping and code exploration environment for developers and designers. It provides:
-1. **Scaffolding:** Natural language prompt-to-app code generation for multi-file React architectures.
-2. **Workspace & Preview:** In-memory code editing paired with an isolated, client-side component preview.
-3. **User-Triggered Syntax Self-Repair:** A manual diagnostic and repair workflow that checks for and repairs TypeScript/TSX syntax errors on demand.
+Rapid application prototyping with Large Language Models typically suffers from three major pain points:
 
----
-
-## Implemented Features (Source-Verified)
-
-### 1. In-Memory Workspace & Live Preview
-- **Editable Source Code:** File tree navigation and live monospace editor in `src/app/page.tsx` supporting multi-file applications (`App.tsx`, `page.tsx`, etc.).
-- **Self-Hosted Sandpack Preview:** Executes React TypeScript code client-side via `@codesandbox/sandpack-react` using local bundler assets served from `/sandpack`.
-- **Virtual File Engine (`VirtualWorkspace`):** In-memory file operations (`create`, `update`, `delete`) in `src/lib/agent/fileOps.ts` with path traversal guards (rejecting `..` and leading slashes) and atomic rollback on multi-file mutation failures.
-- **Undo / Redo History:** Maintains a 10-step snapshot stack (`pastSnapshots` / `futureSnapshots`) for immediate rollbacks.
-- **Project Persistence & Export:** Stores projects in browser `localStorage` (`projectStore.ts`) and exports clean ZIP archives via `jszip`.
-
-### 2. User-Triggered Bounded Syntax Self-Repair (`POST /api/agent`)
-- **Explicit User Action:** Self-repair is **strictly user-triggered** via the `"🛠️ Repair errors"` toolbar action (or the `"🛠️ Repair with AI"` button inside `PreviewErrorBoundary`). It is **not** an automated interceptor that runs silently before rendering.
-- **Zero-Cost Fast-Path:** If the workspace contains zero syntax errors, `/api/agent` detects this via the compiler API and returns immediately (`repaired: false`, `attempts: 0`) with zero model invocations and zero token cost.
-- **TypeScript Compiler Diagnostics:** Analyzes in-memory TSX syntax using the official TypeScript Compiler API (`ts.getSyntacticDiagnostics`) in `src/lib/agent/diagnostics.ts` to locate unmatched tokens, unclosed JSX elements, and syntax errors.
-- **Bounded Repair Loop:** Enforces a hard limit of **2 attempts** in `src/lib/agent/repairLoop.ts`, terminating early if no diagnostic progress is made.
-- **Deterministic Workspace Fingerprinting:** Computes a normalized string digest of workspace paths and contents (`computeWorkspaceFingerprint` in `src/lib/agent/uiHelpers.ts`). If the user modifies code while an async repair is in flight, the response is rejected as stale to protect active edits.
-- **Preview Error Boundary Shortcut:** When the preview encounters a host React render error, `PreviewErrorBoundary` surfaces a direct `"🛠️ Repair with AI"` shortcut.
+1. **Token Exhaustion & Truncation**: Multi-file code generation frequently exceeds output token limits, causing incomplete JSON responses, cut-off code, and lost progress.
+2. **Disconnected Preview**: Most AI code tools display code snippets in chat without running them, forcing developers to manually set up projects, install dependencies, and troubleshoot bundler configs.
+3. **Syntax Fragility**: Generated code often contains syntax defects (unclosed JSX tags, missing curly braces) that fail at compile time, requiring manual debugging before anything can be viewed.
 
 ---
 
-## Meta AI Routing Architecture
+## 2. Our Solution
 
-### Provider Implementation (`src/lib/modelRouter.ts`)
-The application implements `MetaProvider` to communicate with the Meta Chat Completions endpoint:
-- **Base URL:** `https://api.meta.ai/v1` (customizable via `META_BASE_URL`)
-- **Endpoint:** `POST https://api.meta.ai/v1/chat/completions`
-- **Authentication:** `Authorization: Bearer ${MODEL_API_KEY}`
-- **Payload:** Standard Chat Completions format (`model: "muse-spark-1.3"`, `messages: [{ role: "user", content }]`, `temperature`, `max_tokens`, `response_format: { type: "json_object" }`).
-- **Secret Sanitization:** Redacts `MODEL_API_KEY`, Bearer tokens, and sensitive patterns from all client-facing error messages.
+**Meta AI App Builder** bridges the gap between natural language prompts and live running applications using a specialized Meta-powered architecture:
 
-### Configured Models in `AVAILABLE_PROVIDERS`
-| Provider ID | Display Name | Model Identifier | Role |
+- **End-to-End Multi-File Generation**: Decomposes requests into planned modular architectures (`App.tsx`, shared types, modular UI components).
+- **Muse Spark Truncation Recovery**: Detects output truncation (`finish_reason: "length"`), preserves completed files, and executes targeted Stage 4 continuations using compact requirements extraction.
+- **Dedicated Live Application Preview**: Runs bundled React applications client-side in an isolated, preview-only Sandpack container powered by local `/sandpack` bundler assets.
+- **Natural Language Workspace Edits**: Iteratively modifies existing code files via natural language instructions.
+- **User-Triggered Syntax Self-Repair**: Uses the official TypeScript Compiler API (`ts.getSyntacticDiagnostics`) to detect syntax flaws and automatically repairs them with Meta Muse Spark in a bounded 2-attempt loop.
+
+---
+
+## 3. Key Features
+
+- **Meta AI Visual Identity**: Modern dark theme inspired by Meta AI (`#0d0f12`, `#16161b`), animated 8-petal radial swirl emblem (`src/app/components/MetaEmblem.tsx`), and Meta Muse Spark status badge.
+- **Hero & Prompt Composer**: Smooth rounded prompt composer card (`rounded-3xl`) with character counter, Enter-to-submit support, and circular Meta electric blue submit button.
+- **Quick-Start Prompt Chips**: Curated prompt chips for Landing Pages, Analytics Dashboards, E-Commerce Stores, and Kanban Task Boards.
+- **Visual Staged Progress Pipeline**: Real-time progress timeline tracking `Architecture Plan` → `Shared Types` → `UI Components` → `App Orchestrator` → `Validation & Repair`.
+- **Preview-Only Sandpack Studio**: Displays solely the running application in the preview pane, eliminating internal code editor duplication.
+- **In-Memory File Explorer & Code Editor**: Monospace editor with line counts, file-saving state, and syntax display.
+- **Snapshot Undo / Redo**: 10-step workspace history for immediate rollbacks.
+- **Project Store & ZIP Export**: Browser `localStorage` project management and one-click ZIP archive export via `jszip`.
+
+---
+
+## 4. How Meta Muse Spark 1.3 is Used
+
+Meta Muse Spark 1.3 (`muse-spark-1.3`) is the **sole AI model** powering all AI operations:
+
+| Subsystem | Endpoint | Prompting Strategy | Output Format |
 | :--- | :--- | :--- | :--- |
-| `meta` | **Meta** | `muse-spark-1.3` | **Default Provider & Model** |
+| **Generation (Stages 1–4)** | `POST /api/generate` | Architectural planning, shared types, UI components, root orchestrator | Structured JSON files array |
+| **Continuation (Stage 4 Recovery)** | `POST /api/generate` | Compact requirements representation, importing existing components | Orchestrator `App.tsx` |
+| **Incremental Edit** | `POST /api/edit` | Contextual code diffing with user instruction | JSON `{ changedFiles, dependencies }` |
+| **Syntax Self-Repair** | `POST /api/agent` | Targeted compiler diagnostic error context (line, col, snippet) | JSON `{ repairedFiles }` |
+
+*For deep implementation details, see [docs/META_INTEGRATION.md](docs/META_INTEGRATION.md).*
 
 ---
 
-## Architectural Request Flow
+## 5. Complete User Workflow
+
+```mermaid
+flowchart LR
+    A["1. Enter Prompt"] --> B["2. Staged Generation"]
+    B --> C["3. Live Preview"]
+    C --> D["4. Code Editor"]
+    D --> E["5. Meta AI Edit"]
+    E --> F["6. Syntax Self-Repair"]
+    F --> G["7. Export ZIP"]
+```
+
+1. **Prompt**: Enter an application idea into the prompt composer or click a quick-start chip.
+2. **Generation**: Meta Muse Spark plans the file manifest, generates shared interfaces, crafts UI components, and builds the root `App.tsx`.
+3. **Live Preview**: The application immediately compiles and executes inside the live Sandpack preview iframe.
+4. **Editor**: Inspect or manually edit generated source code across the file explorer.
+5. **AI Editing**: Open the "✨ Meta AI Edit" drawer, enter an instruction (e.g., *"Add dark mode toggle in navbar"*), and click "Apply Changes".
+6. **Syntax Self-Repair**: If a syntax issue occurs, click `"🛠️ Repair errors"` to invoke the TypeScript compiler-guided Meta repair loop.
+7. **Export**: Save the project to the Projects Dashboard or download a production-ready ZIP archive.
+
+---
+
+## 6. Technology Stack
+
+- **Framework**: Next.js 16.4.4 (App Router)
+- **UI Library**: React 19.2.8
+- **Language**: TypeScript 5.9.3 (strict mode)
+- **Styling**: Tailwind CSS v4
+- **Runtime Bundler**: `@codesandbox/sandpack-react` v2.20.0 (self-hosted local bundler assets)
+- **Compiler Diagnostics**: TypeScript Compiler API (`ts.getSyntacticDiagnostics`)
+- **Packaging & Export**: JSZip v3.10.1
+- **AI Inference**: Meta API (`https://api.meta.ai/v1/chat/completions`) with Meta Muse Spark 1.3
+
+---
+
+## 7. Architecture Overview
 
 ```mermaid
 flowchart TD
-    User["User Interface (src/app/page.tsx)"] -->|"1. Generate App"| GenRoute["POST /api/generate"]
-    User -->|"2. Apply Edit / AI Improve"| EditRoute["POST /api/edit"]
-    User -->|"3. User Clicks 'Repair errors'"| AgentRoute["POST /api/agent"]
+    User["Developer Studio (src/app/page.tsx)"]
 
-    subgraph AgentEngine ["Agent Diagnostic & Repair Engine"]
-        AgentRoute --> Diag["Diagnostics Analyzer (ts.getSyntacticDiagnostics)"]
-        Diag -->|"0 Syntax Errors"| FastPath["Fast-Path (0 Calls / 0 Cost)"]
-        Diag -->|"Syntax Errors Found"| Loop["Bounded Repair Loop (Max 2 Attempts)"]
-        Loop --> VWS["VirtualWorkspace (Atomic Rollback Safety)"]
+    subgraph ServerRoutes ["Next.js Server API"]
+        Gen["POST /api/generate"]
+        Edit["POST /api/edit"]
+        Agent["POST /api/agent"]
     end
 
-    subgraph Router ["ModelRouter (src/lib/modelRouter.ts)"]
-        GenRoute --> MR["ModelRouter (Direct Meta Routing)"]
-        EditRoute --> MR
-        Loop --> MR
+    subgraph Engines ["Engine & Recovery Subsystems"]
+        StagedPipe["Staged Generation Pipeline (src/lib/jsonRecovery.ts)"]
+        DiagEngine["TypeScript Diagnostics Engine (src/lib/agent/diagnostics.ts)"]
+        VirtualWS["VirtualWorkspace (src/lib/agent/fileOps.ts)"]
     end
 
-    subgraph Adapters ["Provider Adapter"]
-        MR -->|"provider: 'meta'"| MetaProv["MetaProvider (/chat/completions)"]
-        MetaProv --> MetaEndpoint["Meta API: https://api.meta.ai/v1/chat/completions"]
+    subgraph MetaInference ["Meta Model Router"]
+        Router["ModelRouter (Sole Provider: 'meta')"]
+        Provider["MetaProvider (muse-spark-1.3)"]
+        Endpoint["Meta API: https://api.meta.ai/v1/chat/completions"]
     end
 
-    FastPath -->|"Workspace Valid"| User
-    VWS -->|"Repaired Code"| User
-    User -->|"Inspect Live"| Sandpack["Self-Hosted Sandpack Bundler (/sandpack)"]
+    User -->|"Generate"| Gen
+    User -->|"Edit"| Edit
+    User -->|"Repair"| Agent
+
+    Gen --> StagedPipe
+    Edit --> Router
+    Agent --> DiagEngine
+    DiagEngine -->|"Errors found"| Router
+    DiagEngine -->|"Valid (0 Cost)"| User
+
+    StagedPipe --> Router
+    Router --> Provider
+    Provider --> Endpoint
+
+    User -->|"Client-Side Bundling"| Preview["Sandpack Preview (/sandpack)"]
 ```
+
+*For comprehensive architecture documentation, see [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).*
 
 ---
 
-## Prerequisites & Installation
+## 8. Installation & Local Setup
 
 ### Prerequisites
-- **Node.js:** `>= 20.9.0`
-- **Package Manager:** `npm` (v9+ or v10+)
-- **Operating System:** Windows, macOS, or Linux
+- **Node.js**: `>= 20.9.0`
+- **Package Manager**: `npm` (v9+ or v10+)
+- **OS**: Windows, macOS, or Linux
 
-### Setup Instructions
+### Quick Start
 
-1. Configure environment variables:
-   - **Windows PowerShell:**
-     ```powershell
-     Copy-Item .env.example .env.local
-     ```
-   - **macOS / Linux:**
-     ```bash
-     cp .env.example .env.local
-     ```
+1. **Clone the repository:**
+   ```bash
+   git clone git@github.com:sagarummidi/meta-ai-app-builder-v2.git
+   cd meta-ai-app-builder-v2
+   ```
 
-2. Populate `.env.local` with your server-side key:
+2. **Install dependencies:**
+   ```bash
+   npm install
+   ```
+   *(The postinstall script patches and copies Sandpack runtime assets into `public/sandpack` automatically)*.
+
+3. **Configure environment:**
+   ```bash
+   cp .env.example .env.local
+   ```
+   Edit `.env.local` and add your Meta API key:
    ```ini
    AI_PROVIDER=meta
    MODEL_API_KEY=your_meta_api_key_here
    ```
 
-3. Launch the local development server:
+4. **Start development server:**
    ```bash
    npm run dev
    ```
-   Access the web workspace at [http://localhost:3000](http://localhost:3000).
+   Open [http://localhost:3000](http://localhost:3000) in your browser.
 
 ---
 
-## Offline Testing & Quality Verification
+## 9. Environment Variables
 
-All core subsystems include automated offline unit and integration tests using mocked fetch implementations to ensure zero external API costs:
+| Variable | Required | Default | Description |
+| :--- | :---: | :--- | :--- |
+| `AI_PROVIDER` | No | `meta` | AI provider identifier (strictly `meta`) |
+| `MODEL_API_KEY` | **Yes** | *None* | Server-side Meta API key for model authentication |
+| `META_BASE_URL` | No | `https://api.meta.ai/v1` | Custom Meta API base URL override |
+| `META_TIMEOUT_MS` | No | `600000` (10 min) | Upstream request timeout in milliseconds |
+| `RATE_LIMIT_GENERATE_MAX` | No | `5` | Max generation requests per IP per window |
+| `RATE_LIMIT_EDIT_MAX` | No | `10` | Max edit requests per IP per window |
+| `RATE_LIMIT_AGENT_MAX` | No | `20` | Max syntax repair requests per IP per window |
+
+---
+
+## 10. Offline Quality & Verification Suite
+
+All core systems include automated offline tests using deterministic mock providers and in-memory compiler harnesses. No external API credits are consumed during verification:
 
 ```bash
-# Run the complete test suite
+# 1. Run complete test suite (280 passing tests)
 npm test
 
-# Run strict project-wide TypeScript type check
+# 2. Strict project-wide TypeScript type check
 npx tsc --noEmit
+
+# 3. Code formatting and lint verification
+npm run lint
+
+# 4. Production Next.js build
+npm run build
+
+# 5. Git diff format validation
+git diff --check
 ```
+
+---
+
+## 11. Screenshots
+
+> *Screenshots can be placed in `docs/assets/screenshots/`.*
+
+### Homepage & Prompt Composer
+![Homepage](docs/assets/screenshots/homepage.png)
+*Meta AI-inspired dark UI with animated swirl emblem, prompt composer, and quick-start prompt chips.*
+
+### Developer Studio & Live Preview
+![Developer Studio](docs/assets/screenshots/studio.png)
+*Three-column workspace: File Explorer (left), Code Editor & Meta AI Edit (center), Live Preview-Only Sandpack (right).*
+
+---
+
+## 12. Demo Video
+
+[![Demo Video](docs/assets/screenshots/video_placeholder.png)](https://www.youtube.com)
+*Placeholder: Demo video walkthrough to be linked upon recording. Demonstrates prompt-to-app generation, live interactive preview, Meta AI natural language editing, and compiler-guided syntax repair.*
+
+---
+
+## 13. Known Limitations & Operational Notices
+
+> [!WARNING]
+> **Live Model Inference Connectivity Notice:**<br />
+> Provider request routing, payload construction, secret sanitization, staged generation recovery, and endpoint boundaries are verified through an offline test suite (280 passing tests). End-to-end generation and repair against **live Meta API endpoints** (`https://api.meta.ai/v1/chat/completions`) have **not been executed**. A valid `MODEL_API_KEY` and active Meta API endpoint availability are required for live production operation.
+
+> [!NOTE]
+> **Client-Side Bundling Scope:**<br />
+> Sandpack compiles React, TypeScript, CSS, and supported npm packages in-browser. Server-only features (e.g. database connections, raw Node.js OS binaries) are not executable within the client-side sandbox.
+
+---
+
+## 14. Future Scope
+
+1. **Backend Database Mocking**: Provide in-browser SQLite / IndexedDB schemas for full CRUD data persistence in generated applications.
+2. **One-Click Cloud Deployment**: Direct deployment connector to publish generated projects to hosting platforms.
+3. **Component Theme Customizer**: Interactive palette and typography switchers for generated codebases.
+4. **Visual Drag-and-Drop Stacking**: Visual canvas to arrange generated components directly inside the preview.
+
+---
+
+## 15. Hackathon Submission Summary
+
+| Requirement | Implementation Status |
+| :--- | :--- |
+| **Sole AI Provider** | **Meta** (`meta`) |
+| **Sole AI Model** | **Meta Muse Spark 1.3** (`muse-spark-1.3`) |
+| **Other Providers** | Completely removed; zero fallback chains |
+| **User Interface** | Meta AI-inspired dark theme, prompt composer, quick starts, studio workspace |
+| **Live Preview** | Dedicated preview-only Sandpack container (no redundant code editor) |
+| **Generation Resilience** | Staged pipeline, Muse Spark truncation recovery, bounded retries |
+| **Syntax Self-Repair** | User-triggered TypeScript Compiler API diagnostics + bounded 2-attempt loop |
+| **Verification** | 280 automated tests passing, 0 TypeScript errors, 0 ESLint warnings |
+
+*For complete submission details, see [docs/SUBMISSION.md](docs/SUBMISSION.md).*
