@@ -1,5 +1,4 @@
 import { NextResponse } from "next/server";
-import ts from "typescript";
 import {
   modelRouter,
   AVAILABLE_PROVIDERS,
@@ -12,6 +11,15 @@ import {
   type IRateLimiter,
   type ConcurrencyLimiter,
 } from "@/lib/rateLimiter";
+import {
+  safeParseJson,
+  validateEditOutput,
+  isFinishReasonTruncated,
+  type EditOutput,
+} from "@/lib/jsonRecovery";
+
+export const maxDuration = 300;
+export const dynamic = "force-dynamic";
 
 const MAX_INSTRUCTION_LENGTH = 15000;
 
@@ -36,114 +44,6 @@ const responseSchema = {
   },
   required: ["changedFiles"],
 };
-
-function sanitizeJsonControlCharacters(raw: string): string {
-  let result = "";
-  let insideString = false;
-  let isEscaped = false;
-
-  for (let i = 0; i < raw.length; i++) {
-    const char = raw[i];
-    const code = raw.charCodeAt(i);
-
-    if (insideString && !isEscaped && code >= 0x00 && code <= 0x1f) {
-      switch (char) {
-        case "\n":
-          result += "\\n";
-          break;
-        case "\r":
-          result += "\\r";
-          break;
-        case "\t":
-          result += "\\t";
-          break;
-        default:
-          result += "\\u" + code.toString(16).padStart(4, "0");
-      }
-      continue;
-    }
-
-    result += char;
-
-    if (char === '"' && !isEscaped) {
-      insideString = !insideString;
-    }
-
-    isEscaped = char === "\\" && !isEscaped;
-  }
-
-  return result;
-}
-
-function findSyntaxError(path: string, code: string): string | null {
-  const scriptKind = path.endsWith(".tsx")
-    ? ts.ScriptKind.TSX
-    : path.endsWith(".jsx")
-    ? ts.ScriptKind.JSX
-    : ts.ScriptKind.TS;
-
-  const sourceFile = ts.createSourceFile(
-    path,
-    code,
-    ts.ScriptTarget.Latest,
-    true,
-    scriptKind
-  );
-
-  const compilerOptions: ts.CompilerOptions = {
-    noLib: true,
-    noResolve: true,
-    target: ts.ScriptTarget.Latest,
-    jsx: ts.JsxEmit.Preserve,
-    allowJs: true,
-  };
-
-  const host: ts.CompilerHost = {
-    getSourceFile: (fileName) =>
-      fileName === path ? sourceFile : undefined,
-    getDefaultLibFileName: () => "lib.d.ts",
-    writeFile: () => {},
-    getCurrentDirectory: () => "",
-    getCanonicalFileName: (fileName) => fileName,
-    useCaseSensitiveFileNames: () => true,
-    getNewLine: () => "\n",
-    fileExists: (fileName) => fileName === path,
-    readFile: (fileName) => (fileName === path ? code : undefined),
-  };
-
-  const program = ts.createProgram([path], compilerOptions, host);
-  const diagnostics = program.getSyntacticDiagnostics(sourceFile);
-
-  if (diagnostics.length === 0) {
-    return null;
-  }
-
-  const first = diagnostics[0];
-  const message = ts.flattenDiagnosticMessageText(first.messageText, "\n");
-  const { line, character } = sourceFile.getLineAndCharacterOfPosition(
-    first.start ?? 0
-  );
-
-  return `${path}:${line + 1}:${character + 1} - ${message}`;
-}
-
-function findFirstSyntaxError(
-  files: { path: string; code: string }[]
-): string | null {
-  for (const file of files) {
-    if (file && typeof file.path === "string" && typeof file.code === "string") {
-      if (file.path.endsWith(".ts") || file.path.endsWith(".tsx")) {
-        const error = findSyntaxError(file.path, file.code);
-
-        if (error) {
-          return error;
-        }
-      }
-    }
-  }
-
-  return null;
-}
 
 export async function POST(request: Request, context?: unknown) {
   const serverReqId = Math.random().toString(36).substring(2, 10);
@@ -277,7 +177,7 @@ export async function POST(request: Request, context?: unknown) {
 
     const filesString = validCurrentFiles.map((f: { name: string; code: string }) => `File: ${f.name}\n\`\`\`\n${f.code}\n\`\`\``).join("\n\n");
 
-    console.log(`[Req ${reqId}] Calling ModelRouter with fallback (${providerType}, model: ${modelToUse}) for edit...`);
+    console.log(`[Req ${reqId}] Calling ModelRouter (${providerType}, model: ${modelToUse}) for edit...`);
     const editStartTime = Date.now();
 
     const activeConcurrencyLimiter = injectedConcurrencyLimiter || defaultConcurrencyLimiter;
@@ -317,105 +217,89 @@ Rules:
 - Every string, template literal, and regular expression literal must be properly closed.
 - Every parenthesis, bracket, and brace must be balanced.
 `,
-        generationConfig: {
-          thinking_level: "low",
+          generationConfig: {
+            thinking_level: "low",
+          },
+          responseFormat: {
+            type: "text",
+            mime_type: "application/json",
+            schema: responseSchema,
+          },
+          requestId: reqId,
+          disableFallback: true,
         },
-        responseFormat: {
-          type: "text",
-          mime_type: "application/json",
-          schema: responseSchema,
-        },
-        requestId: reqId,
-        disableFallback: true,
-      },
-      providerType
-    ));
+        providerType
+      )
+    );
 
     const editDuration = Date.now() - editStartTime;
     const response = fallbackResult.response;
     const output = response.outputText;
+    const isTruncated =
+      response.truncated === true ||
+      isFinishReasonTruncated(response.finishReason);
 
-    console.log(`[Req ${reqId}] Provider ${fallbackResult.usedProvider} edit finished in ${editDuration}ms. Output length: ${output?.length || 0}`);
+    console.log(
+      `[Req ${reqId}] Provider ${fallbackResult.usedProvider} edit finished in ${editDuration}ms. Output length: ${output?.length || 0}, finishReason: ${response.finishReason || "none"}, truncated: ${isTruncated}`
+    );
 
     if (!output || !output.trim()) {
       throw new Error(`${fallbackResult.usedProvider} returned no output.`);
     }
 
-    const cleanOutput = output
-      .replace(/^```json\s*/i, "")
-      .replace(/^```\s*/i, "")
-      .replace(/\s*```$/i, "")
-      .trim();
-
-    const start = cleanOutput.indexOf("{");
-    const end = cleanOutput.lastIndexOf("}");
-
-    if (start === -1 || end === -1) {
-      throw new Error(`${fallbackResult.usedProvider} did not return valid JSON.`);
+    if (isTruncated) {
+      throw new Error(
+        `${fallbackResult.usedProvider} response was truncated due to output token limits during edit. Please break your request into smaller edits.`
+      );
     }
 
-    const jsonText = cleanOutput.slice(start, end + 1);
-    const sanitizedJsonText = sanitizeJsonControlCharacters(jsonText);
+    const parseStartTime = Date.now();
+    const parseResult = safeParseJson<EditOutput>(output);
+    const jsonParsingDuration = Date.now() - parseStartTime;
 
-    let result;
-    try {
-      result = JSON.parse(sanitizedJsonText);
-    } catch (parseError) {
-      console.error(`[Req ${reqId}] JSON.parse failed on ${fallbackResult.usedProvider} output:`, parseError);
+    if (!parseResult.success || !parseResult.data) {
+      if (parseResult.isTruncated) {
+        throw new Error(
+          `${fallbackResult.usedProvider} response was truncated due to output token limits during edit.`
+        );
+      }
       throw new Error(
         `${fallbackResult.usedProvider} returned malformed JSON that could not be parsed, even after sanitization.`
       );
     }
 
-    if (!result || typeof result !== "object" || Array.isArray(result)) {
-      throw new Error(`${fallbackResult.usedProvider} returned invalid JSON structure (expected an object).`);
-    }
+    const valStartTime = Date.now();
+    const validation = validateEditOutput(parseResult.data);
+    const syntaxValidationDuration = Date.now() - valStartTime;
 
-    if (!result.changedFiles || !Array.isArray(result.changedFiles)) {
-      throw new Error(`${fallbackResult.usedProvider} did not return a valid changedFiles array.`);
-    }
-
-    const validChangedFiles: { path: string; code: string }[] = [];
-    for (const file of result.changedFiles) {
-      if (!file || typeof file !== "object") continue;
-      const path = typeof file.path === "string" ? file.path.trim() : "";
-      const code = typeof file.code === "string" ? file.code : "";
-      if (path && code) {
-        validChangedFiles.push({ path, code });
-      }
-    }
-
-    const rawDeps = result.dependencies;
-    const dependencies: Record<string, string> = {};
-    if (rawDeps && typeof rawDeps === "object" && !Array.isArray(rawDeps)) {
-      for (const [key, val] of Object.entries(rawDeps)) {
-        if (typeof key === "string" && key.trim()) {
-          dependencies[key.trim()] = typeof val === "string" ? val : String(val ?? "latest");
-        }
-      }
-    }
-
-    const syntaxError = findFirstSyntaxError(validChangedFiles);
-
-    if (syntaxError) {
+    if (!validation.valid || !validation.changedFiles) {
       throw new Error(
-        `${fallbackResult.usedProvider} generated invalid TypeScript and it was rejected before reaching the preview (${syntaxError}). Please try editing again.`
+        validation.error ||
+          `${fallbackResult.usedProvider} generated invalid edit output.`
       );
     }
 
     const totalDuration = Date.now() - startTime;
-    console.log(`[Req ${reqId}] Edit request successfully completed in ${totalDuration}ms`);
+    console.log(
+      `[Req ${reqId}] Edit request successfully completed in ${totalDuration}ms (model: ${editDuration}ms, json: ${jsonParsingDuration}ms, syntax: ${syntaxValidationDuration}ms)`
+    );
 
     return NextResponse.json({
       success: true,
       requestId: reqId,
       instruction,
-      changedFiles: validChangedFiles,
-      dependencies,
+      changedFiles: validation.changedFiles,
+      dependencies: validation.dependencies || {},
       usedModel: fallbackResult.usedModel,
       usedProvider: fallbackResult.usedProvider,
       fallbackUsed: fallbackResult.fallbackUsed,
       fallbackNotice: fallbackResult.fallbackNotice,
+      timings: {
+        totalDurationMs: totalDuration,
+        modelRequestDurationMs: editDuration,
+        jsonParsingDurationMs: jsonParsingDuration,
+        syntaxValidationDurationMs: syntaxValidationDuration,
+      },
     });
   } catch (error) {
     const totalDuration = Date.now() - startTime;

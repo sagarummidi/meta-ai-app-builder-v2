@@ -307,6 +307,29 @@ export default function Home() {
 
   const [fallbackNotice, setFallbackNotice] = useState<string | null>(null);
   const [generationError, setGenerationError] = useState<string | null>(null);
+  const [generationElapsed, setGenerationElapsed] = useState(0);
+
+  useEffect(() => {
+    if (!loading) return;
+    const timer = setInterval(() => {
+      setGenerationElapsed((prev) => prev + 1);
+    }, 1000);
+    return () => clearInterval(timer);
+  }, [loading]);
+
+  function getGenerationProgressMessage(): string {
+    if (generationElapsed < 5) {
+      return "Connecting to Meta provider and initializing generation...";
+    } else if (generationElapsed < 25) {
+      return `Generating application components... (${generationElapsed}s)`;
+    } else if (generationElapsed < 60) {
+      return `Building complete project structure and types... (${generationElapsed}s)`;
+    } else if (generationElapsed < 90) {
+      return `Validating TypeScript syntax and recovering complete files... (${generationElapsed}s)`;
+    } else {
+      return `Finalizing application... Large codebases may take up to 2-3 minutes (${generationElapsed}s)`;
+    }
+  }
 
   const [pastSnapshots, setPastSnapshots] = useState<WorkspaceSnapshot[]>([]);
   const [futureSnapshots, setFutureSnapshots] = useState<WorkspaceSnapshot[]>([]);
@@ -841,6 +864,7 @@ export default function Home() {
 
     isGeneratingRef.current = true;
     setLoading(true);
+    setGenerationElapsed(0);
     setGenerationError(null);
     setRepairSuccess(null);
     setRepairError(null);
@@ -952,10 +976,17 @@ export default function Home() {
       setCurrentProjectId(null);
     } catch (error) {
       console.error("Generation error:", error);
-      const msg =
+      const rawMsg =
         error instanceof Error
           ? error.message
           : "Something went wrong while generating the app.";
+      const isTimeout =
+        /timed? ?out/i.test(rawMsg) ||
+        /504/i.test(rawMsg) ||
+        /gateway timeout/i.test(rawMsg);
+      const msg = isTimeout
+        ? `${rawMsg} You can try refining your prompt to be more concise or breaking it into smaller steps.`
+        : rawMsg;
       setGenerationError(msg);
       alert(msg);
     } finally {
@@ -997,6 +1028,7 @@ export default function Home() {
 
     isGeneratingRef.current = true;
     setLoading(true);
+    setGenerationElapsed(0);
     setGenerationError(null);
     setRepairSuccess(null);
     setRepairError(null);
@@ -1104,10 +1136,17 @@ export default function Home() {
       setCurrentProjectId(null);
     } catch (error) {
       console.error("Regeneration error:", error);
-      const msg =
+      const rawMsg =
         error instanceof Error
           ? error.message
           : "Something went wrong while regenerating the app.";
+      const isTimeout =
+        /timed? ?out/i.test(rawMsg) ||
+        /504/i.test(rawMsg) ||
+        /gateway timeout/i.test(rawMsg);
+      const msg = isTimeout
+        ? `${rawMsg} You can try refining your prompt to be more concise or breaking it into smaller steps.`
+        : rawMsg;
       setGenerationError(msg);
       alert(msg);
     } finally {
@@ -1815,7 +1854,7 @@ createRoot(document.getElementById("root")!).render(
                 cursor: isBusy ? "not-allowed" : "pointer",
               }}
             >
-              {loading ? "Generating..." : "Generate App"}
+              {loading ? `Generating... (${generationElapsed}s)` : "Generate App"}
             </button>
 
             <button
@@ -1835,6 +1874,27 @@ createRoot(document.getElementById("root")!).render(
               📂 My Projects
             </button>
           </div>
+
+          {loading && (
+            <div
+              style={{
+                marginTop: "16px",
+                padding: "12px 20px",
+                borderRadius: "8px",
+                background: "rgba(30, 41, 59, 0.85)",
+                border: "1px solid #334155",
+                color: "#93c5fd",
+                fontSize: "14px",
+                display: "flex",
+                alignItems: "center",
+                justifyContent: "center",
+                gap: "10px",
+              }}
+            >
+              <span style={{ fontSize: "16px" }}>⏳</span>
+              <span>{getGenerationProgressMessage()}</span>
+            </div>
+          )}
         </div>
       ) : (
         <div>
@@ -2113,6 +2173,22 @@ createRoot(document.getElementById("root")!).render(
               >
                 {prompt}
               </p>
+
+              {loading && (
+                <div
+                  style={{
+                    marginTop: "8px",
+                    color: "#93c5fd",
+                    fontSize: "13px",
+                    display: "flex",
+                    alignItems: "center",
+                    gap: "6px",
+                  }}
+                >
+                  <span>⏳</span>
+                  <span>{getGenerationProgressMessage()}</span>
+                </div>
+              )}
             </div>
 
             <div style={{ display: "flex", gap: "10px", flexWrap: "wrap", alignItems: "center" }}>
@@ -2128,7 +2204,7 @@ createRoot(document.getElementById("root")!).render(
                   cursor: isBusy ? "not-allowed" : "pointer",
                 }}
               >
-                {loading ? "Regenerating..." : "🔄 Regenerate"}
+                {loading ? `Regenerating... (${generationElapsed}s)` : "🔄 Regenerate"}
               </button>
 
               <button

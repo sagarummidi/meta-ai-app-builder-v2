@@ -130,10 +130,18 @@ export interface ModelRequest {
   };
   requestId?: string;
   disableFallback?: boolean;
+  timeoutMs?: number;
 }
 
 export interface ModelResponse {
   outputText: string;
+  finishReason?: string;
+  truncated?: boolean;
+  rawUsage?: {
+    promptTokens?: number;
+    completionTokens?: number;
+    totalTokens?: number;
+  };
 }
 
 export interface GenerateWithFallbackResult {
@@ -150,6 +158,24 @@ export interface GenerateWithFallbackResult {
 export interface ModelProvider {
   name: ModelProviderType;
   generate(request: ModelRequest): Promise<ModelResponse>;
+}
+
+export const DEFAULT_PROVIDER_TIMEOUT_MS = 180000; // 180 seconds (3 minutes)
+
+export function resolveProviderTimeoutMs(): number {
+  const envVal = (
+    process.env.META_TIMEOUT_MS ||
+    process.env.AI_PROVIDER_TIMEOUT_MS ||
+    process.env.MODEL_TIMEOUT_MS ||
+    ""
+  ).trim();
+  if (envVal) {
+    const parsed = parseInt(envVal, 10);
+    if (!isNaN(parsed) && parsed > 0) {
+      return parsed;
+    }
+  }
+  return DEFAULT_PROVIDER_TIMEOUT_MS;
 }
 
 export interface MetaProviderConfig {
@@ -208,6 +234,16 @@ export class MetaProvider implements ModelProvider {
       bodyPayload.response_format = { type: "json_object" };
     }
 
+    const timeoutMs = request.timeoutMs ?? resolveProviderTimeoutMs();
+    const controller = new AbortController();
+    let timedOut = false;
+    const timer = setTimeout(() => {
+      timedOut = true;
+      controller.abort(
+        new Error(`Meta API request timed out after ${Math.round(timeoutMs / 1000)}s`)
+      );
+    }, timeoutMs);
+
     let response: Response;
     try {
       response = await fetchFunc(endpoint, {
@@ -217,15 +253,37 @@ export class MetaProvider implements ModelProvider {
           Authorization: `Bearer ${apiKey}`,
         },
         body: JSON.stringify(bodyPayload),
-        signal: AbortSignal.timeout(90000),
+        signal: controller.signal,
       });
     } catch (networkError) {
+      const isTimeout =
+        timedOut ||
+        (networkError instanceof Error &&
+          (networkError.name === "TimeoutError" ||
+            networkError.name === "AbortError" ||
+            /timeout/i.test(networkError.message)));
+
+      if (isTimeout) {
+        const timeoutErr = new Error(
+          sanitizeErrorMessage(
+            `Meta API request timed out after ${Math.round(
+              timeoutMs / 1000
+            )}s. Upstream model took too long to complete.`
+          )
+        );
+        (timeoutErr as unknown as { status: number; statusCode: number }).status = 504;
+        (timeoutErr as unknown as { status: number; statusCode: number }).statusCode = 504;
+        throw timeoutErr;
+      }
+
       const baseMsg =
         networkError instanceof Error ? networkError.message : "Unknown network error";
       const netErr = new Error(sanitizeErrorMessage(`Meta API network request failed: ${baseMsg}`));
       (netErr as unknown as { status: number; statusCode: number }).status = 503;
       (netErr as unknown as { status: number; statusCode: number }).statusCode = 503;
       throw netErr;
+    } finally {
+      clearTimeout(timer);
     }
 
     if (!response.ok) {
@@ -270,9 +328,14 @@ export class MetaProvider implements ModelProvider {
       throw parseErr;
     }
 
-    const outputText = (data as {
-      choices?: Array<{ message?: { content?: string | null } }>;
-    })?.choices?.[0]?.message?.content;
+    const choice = (data as {
+      choices?: Array<{
+        message?: { content?: string | null };
+        finish_reason?: string;
+      }>;
+    })?.choices?.[0];
+
+    const outputText = choice?.message?.content;
 
     if (typeof outputText !== "string" || !outputText.trim()) {
       const malformedErr = new Error("Meta returned an empty completion.");
@@ -281,8 +344,30 @@ export class MetaProvider implements ModelProvider {
       throw malformedErr;
     }
 
+    const finishReason = choice?.finish_reason;
+    const truncated =
+      typeof finishReason === "string" &&
+      (finishReason.trim().toLowerCase() === "length" ||
+        finishReason.trim().toLowerCase() === "max_tokens");
+    const usage = (data as {
+      usage?: {
+        prompt_tokens?: number;
+        completion_tokens?: number;
+        total_tokens?: number;
+      };
+    })?.usage;
+
     return {
       outputText,
+      finishReason,
+      truncated,
+      rawUsage: usage
+        ? {
+            promptTokens: usage.prompt_tokens,
+            completionTokens: usage.completion_tokens,
+            totalTokens: usage.total_tokens,
+          }
+        : undefined,
     };
   }
 }
@@ -476,12 +561,18 @@ export function getErrorStatusCode(error: unknown): number {
   if (
     lowerMsg.includes("504") ||
     lowerMsg.includes("gateway timeout") ||
+    lowerMsg.includes("timed out") ||
     lowerMsg.includes("timeout")
   ) {
     return 504;
   }
 
-  if (lowerMsg.includes("502") || lowerMsg.includes("bad gateway")) {
+  if (
+    lowerMsg.includes("502") ||
+    lowerMsg.includes("bad gateway") ||
+    lowerMsg.includes("truncated due to") ||
+    lowerMsg.includes("output token limits")
+  ) {
     return 502;
   }
 
