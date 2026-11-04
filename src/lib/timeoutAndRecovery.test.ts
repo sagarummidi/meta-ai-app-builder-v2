@@ -48,7 +48,7 @@ describe("Timeout & Recovery Hardening: Provider Timeout Configuration & Handlin
       delete process.env.AI_PROVIDER_TIMEOUT_MS;
       delete process.env.MODEL_TIMEOUT_MS;
       assert.equal(resolveProviderTimeoutMs(), DEFAULT_PROVIDER_TIMEOUT_MS);
-      assert.equal(resolveProviderTimeoutMs(), 180000);
+      assert.equal(resolveProviderTimeoutMs(), 600000);
 
       process.env.META_TIMEOUT_MS = "240000";
       assert.equal(resolveProviderTimeoutMs(), 240000);

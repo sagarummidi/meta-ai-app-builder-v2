@@ -17,7 +17,7 @@ import {
 } from "@/lib/jsonRecovery";
 import { globalJobStore } from "@/lib/generationJobs";
 
-export const maxDuration = 300;
+export const maxDuration = 600;
 export const dynamic = "force-dynamic";
 
 const MAX_PROMPT_LENGTH = 15000;
@@ -53,6 +53,7 @@ export async function GET(request: Request) {
         stageMessage: job.stageMessage,
         error: job.error,
         message: job.error || "Generation job failed.",
+        completedFilePaths: job.completedFilePaths,
       },
       { status: job.statusCode || 500 }
     );
@@ -241,7 +242,11 @@ export async function POST(request: Request, context?: unknown) {
           const safeMessage = sanitizeErrorMessage(rawMessage);
           globalJobStore.failJob(reqId, safeMessage, statusCode);
         }
-      })();
+      })().catch((unhandledErr) => {
+        const statusCode = getErrorStatusCode(unhandledErr);
+        const rawMessage = unhandledErr instanceof Error ? unhandledErr.message : "Unexpected background task failure.";
+        globalJobStore.failJob(reqId, sanitizeErrorMessage(rawMessage), statusCode);
+      });
 
       return NextResponse.json({
         success: true,

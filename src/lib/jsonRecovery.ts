@@ -3,6 +3,7 @@ import {
   type ModelRouter,
   type ModelProviderType,
   isRetryableModelError,
+  DEFAULT_PROVIDER_TIMEOUT_MS,
 } from "./modelRouter";
 import { normalizeWorkspacePath } from "./agent/fileOps";
 import type { ConcurrencyLimiter } from "./rateLimiter";
@@ -1479,12 +1480,13 @@ export async function executeStagedGenerationPipeline(
     requestId,
     disableFallback,
     concurrencyLimiter,
-    timeoutMs,
+    timeoutMs = DEFAULT_PROVIDER_TIMEOUT_MS,
     onProgress,
     maxComponentRetries = 1,
   } = options;
 
   const startPipelineTime = Date.now();
+  const pipelineDeadline = startPipelineTime + timeoutMs; // overall pipeline deadline (default 10 minutes)
   let initialRequestDurationMs = 0;
   let continuationDurationMs = 0;
   let jsonParsingDurationMs = 0;
@@ -1500,7 +1502,16 @@ export async function executeStagedGenerationPipeline(
 
   async function invokeModel(promptText: string): Promise<string> {
     const callStartTime = Date.now();
+    const remainingMs = pipelineDeadline - Date.now();
+    if (remainingMs <= 0) {
+      const deadlineErr = new Error("Application generation pipeline exceeded maximum allowed duration (10 minutes).");
+      (deadlineErr as unknown as { status: number; statusCode: number }).status = 504;
+      (deadlineErr as unknown as { status: number; statusCode: number }).statusCode = 504;
+      throw deadlineErr;
+    }
+
     modelCallsCount++;
+    const callTimeoutMs = Math.min(timeoutMs, remainingMs);
 
     const modelCallFn = () =>
       modelRouter.generateWithFallback(
@@ -1516,7 +1527,7 @@ export async function executeStagedGenerationPipeline(
           },
           requestId,
           disableFallback,
-          timeoutMs,
+          timeoutMs: callTimeoutMs,
         },
         provider
       );
@@ -1650,6 +1661,13 @@ Return ONLY valid JSON matching this schema:
       !sharedFiles.some((sf) => sf.path === f.path)
   );
 
+  if (Date.now() > pipelineDeadline) {
+    const deadlineErr = new Error("Application generation pipeline exceeded maximum allowed duration (10 minutes).");
+    (deadlineErr as unknown as { status: number; statusCode: number }).status = 504;
+    (deadlineErr as unknown as { status: number; statusCode: number }).statusCode = 504;
+    throw deadlineErr;
+  }
+
   // --- STAGE 2: GENERATE SHARED TYPES & UTILITIES ---
   for (let i = 0; i < sharedFiles.length; i++) {
     const file = sharedFiles[i];
@@ -1692,6 +1710,13 @@ Return ONLY valid JSON:
     } catch (sharedErr) {
       console.warn(`[Req ${requestId}] Failed to generate shared file ${file.path}:`, sharedErr);
     }
+  }
+
+  if (Date.now() > pipelineDeadline) {
+    const deadlineErr = new Error("Application generation pipeline exceeded maximum allowed duration (10 minutes).");
+    (deadlineErr as unknown as { status: number; statusCode: number }).status = 504;
+    (deadlineErr as unknown as { status: number; statusCode: number }).statusCode = 504;
+    throw deadlineErr;
   }
 
   // --- STAGE 3: GENERATE INDIVIDUAL COMPONENTS ---
@@ -1784,6 +1809,13 @@ Return ONLY valid JSON:
     }
   }
 
+  if (Date.now() > pipelineDeadline) {
+    const deadlineErr = new Error("Application generation pipeline exceeded maximum allowed duration (10 minutes).");
+    (deadlineErr as unknown as { status: number; statusCode: number }).status = 504;
+    (deadlineErr as unknown as { status: number; statusCode: number }).statusCode = 504;
+    throw deadlineErr;
+  }
+
   // --- STAGE 4: GENERATE MAIN APPLICATION ENTRY POINT (App.tsx) ---
   onProgress?.("Generating main application entry point (App.tsx)...", 80, accumulatedFiles);
 
@@ -1791,16 +1823,20 @@ Return ONLY valid JSON:
     .map((f) => `- ${f.path}`)
     .join("\n");
 
+  const typesFile = accumulatedFiles.find((f) => f.path === "types.ts");
+  const typesSummary =
+    typesFile && typesFile.code.length < 2500
+      ? `\nType definitions:\n${typesFile.code}\n`
+      : "";
+
   const baseAppPrompt = `Generate the main application file "App.tsx" for the application "${userPrompt}".
 
 Available components and files in the project:
 ${availableFilesSummary || "- (Single file application)"}
-
-${sharedContext ? `Existing types:\n${sharedContext}\n` : ""}
+${typesSummary}
 Rules:
-- The main file must be App.tsx.
-- Default export must be the App component: export default function App().
-- Import and render the available components.
+- The main file must be App.tsx with default export: export default function App().
+- Import and connect the available components cleanly.
 - Manage root application state and user interactions cleanly.
 - Use React and TypeScript.
 - Return ONLY valid JSON:
@@ -1821,6 +1857,13 @@ Rules:
   let lastAppStatusCode: number | undefined;
 
   while (!appGenerated && appRetries <= maxComponentRetries) {
+    if (Date.now() >= pipelineDeadline) {
+      const deadlineErr = new Error("Application generation pipeline exceeded maximum allowed duration (10 minutes).");
+      (deadlineErr as unknown as { status: number; statusCode: number }).status = 504;
+      (deadlineErr as unknown as { status: number; statusCode: number }).statusCode = 504;
+      throw deadlineErr;
+    }
+
     if (appRetries > 0) {
       // Sensible bounded backoff delay before retry
       await new Promise((resolve) => setTimeout(resolve, 300 * appRetries));
@@ -1908,6 +1951,13 @@ Rules:
       (finalErr as unknown as { status: number; statusCode: number }).statusCode = lastAppStatusCode;
     }
     throw finalErr;
+  }
+
+  if (Date.now() > pipelineDeadline) {
+    const deadlineErr = new Error("Application generation pipeline exceeded maximum allowed duration (10 minutes).");
+    (deadlineErr as unknown as { status: number; statusCode: number }).status = 504;
+    (deadlineErr as unknown as { status: number; statusCode: number }).statusCode = 504;
+    throw deadlineErr;
   }
 
   // --- STAGE 5: VALIDATE & REPAIR MISSING IMPORTS ---

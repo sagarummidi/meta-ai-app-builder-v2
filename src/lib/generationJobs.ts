@@ -40,6 +40,10 @@ export interface GenerationJob {
 
 const JOB_TTL_MS = 15 * 60 * 1000; // 15 minutes TTL for jobs in memory
 const MAX_JOBS_STORED = 200;
+export const MAX_GENERATION_DURATION_MS = 10 * 60 * 1000; // 10 minutes (600,000 ms)
+export const MAX_JOB_CLEANUP_GRACE_PERIOD_MS = 30 * 1000; // 30 seconds grace period
+export const MAX_JOB_ACTIVE_DURATION_MS =
+  MAX_GENERATION_DURATION_MS + MAX_JOB_CLEANUP_GRACE_PERIOD_MS; // 630,000 ms (10.5 minutes)
 
 class GenerationJobStore {
   private jobs = new Map<string, GenerationJob>();
@@ -71,6 +75,22 @@ class GenerationJobStore {
   }
 
   public getJob(id: string): GenerationJob | undefined {
+    const job = this.jobs.get(id);
+    if (!job) return undefined;
+
+    // Automatically transition to failed if active job exceeds maximum active duration
+    if (
+      job.status !== "completed" &&
+      job.status !== "failed" &&
+      Date.now() - job.createdAt > MAX_JOB_ACTIVE_DURATION_MS
+    ) {
+      this.failJob(
+        id,
+        "Generation job exceeded maximum execution time (10m). Upstream model took too long to complete.",
+        504
+      );
+    }
+
     return this.jobs.get(id);
   }
 
@@ -156,4 +176,10 @@ class GenerationJobStore {
   }
 }
 
-export const globalJobStore = new GenerationJobStore();
+declare global {
+  var __metaAiGenerationJobStore: GenerationJobStore | undefined;
+}
+
+export const globalJobStore =
+  globalThis.__metaAiGenerationJobStore ??
+  (globalThis.__metaAiGenerationJobStore = new GenerationJobStore());
