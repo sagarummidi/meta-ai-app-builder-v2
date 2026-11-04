@@ -69,7 +69,11 @@ export function isRetryableModelError(error: unknown): boolean {
     lowerMsg.includes("please provide") ||
     lowerMsg.includes("invalid api key") ||
     lowerMsg.includes("invalid model") ||
-    lowerMsg.includes("bad request")
+    lowerMsg.includes("bad request") ||
+    lowerMsg.includes("refused to generate") ||
+    lowerMsg.includes("refusal") ||
+    lowerMsg.includes("filtered by safety") ||
+    lowerMsg.includes("content_filter")
   ) {
     return false;
   }
@@ -80,6 +84,7 @@ export function isRetryableModelError(error: unknown): boolean {
     lowerMsg.includes("502") ||
     lowerMsg.includes("503") ||
     lowerMsg.includes("504") ||
+    lowerMsg.includes("empty completion") ||
     lowerMsg.includes("rate limit") ||
     lowerMsg.includes("high demand") ||
     lowerMsg.includes("overloaded") ||
@@ -182,6 +187,214 @@ export interface MetaProviderConfig {
   baseUrl?: string;
   apiKey?: string;
   fetchFn?: typeof fetch;
+}
+
+export interface MetaExtractedResponse {
+  outputText: string;
+  finishReason?: string;
+  truncated: boolean;
+  rawUsage?: {
+    promptTokens?: number;
+    completionTokens?: number;
+    totalTokens?: number;
+  };
+}
+
+export function extractTextFromMetaResponse(data: unknown): MetaExtractedResponse {
+  if (!data || typeof data !== "object" || Array.isArray(data)) {
+    const err = new Error("Unexpected Meta API response structure: response body is not a JSON object.");
+    (err as unknown as { status: number; statusCode: number }).status = 502;
+    (err as unknown as { status: number; statusCode: number }).statusCode = 502;
+    throw err;
+  }
+
+  const payload = data as Record<string, unknown>;
+
+  // Check for error payload returned within a 200 OK
+  if (payload.error) {
+    let errorDetail = "Unknown upstream error";
+    if (typeof payload.error === "string") {
+      errorDetail = payload.error;
+    } else if (typeof payload.error === "object" && payload.error !== null) {
+      const errObj = payload.error as Record<string, unknown>;
+      errorDetail = typeof errObj.message === "string" ? errObj.message : JSON.stringify(payload.error);
+    }
+    const err = new Error(sanitizeErrorMessage(`Meta API returned an error: ${errorDetail}`));
+    (err as unknown as { status: number; statusCode: number }).status = 502;
+    (err as unknown as { status: number; statusCode: number }).statusCode = 502;
+    throw err;
+  }
+
+  const choices = payload.choices;
+  let choice: Record<string, unknown> | undefined;
+
+  if (Array.isArray(choices)) {
+    if (choices.length === 0) {
+      const err = new Error("Meta API returned an empty 'choices' array (0 choices).");
+      (err as unknown as { status: number; statusCode: number }).status = 502;
+      (err as unknown as { status: number; statusCode: number }).statusCode = 502;
+      throw err;
+    }
+    const firstChoice = choices[0];
+    if (firstChoice && typeof firstChoice === "object") {
+      choice = firstChoice as Record<string, unknown>;
+    }
+  }
+
+  // Check for model refusal
+  if (choice) {
+    const messageObj =
+      choice.message && typeof choice.message === "object"
+        ? (choice.message as Record<string, unknown>)
+        : undefined;
+    const refusal = messageObj?.refusal || choice.refusal;
+    if (typeof refusal === "string" && refusal.trim()) {
+      const err = new Error(
+        sanitizeErrorMessage(`Meta model refused to generate completion: ${refusal.trim()}`)
+      );
+      (err as unknown as { status: number; statusCode: number }).status = 502;
+      (err as unknown as { status: number; statusCode: number }).statusCode = 502;
+      throw err;
+    }
+  }
+
+  // Extract text from choice or top-level fields
+  let extractedText: string | undefined;
+  let isNullContent = false;
+
+  if (choice) {
+    const messageObj =
+      choice.message && typeof choice.message === "object"
+        ? (choice.message as Record<string, unknown>)
+        : undefined;
+
+    if (messageObj && "content" in messageObj) {
+      const content = messageObj.content;
+      if (typeof content === "string") {
+        extractedText = content;
+      } else if (content === null) {
+        isNullContent = true;
+      } else if (Array.isArray(content)) {
+        // Multi-part content parts: [{ type: "text", text: "..." }]
+        const partsText = content
+          .map((part) => {
+            if (typeof part === "string") return part;
+            if (part && typeof part === "object") {
+              const partObj = part as Record<string, unknown>;
+              if (typeof partObj.text === "string") return partObj.text;
+              if (typeof partObj.content === "string") return partObj.content;
+            }
+            return "";
+          })
+          .join("");
+        if (partsText) {
+          extractedText = partsText;
+        }
+      } else if (typeof content === "object" && content !== null) {
+        const contentObj = content as Record<string, unknown>;
+        if (typeof contentObj.text === "string") {
+          extractedText = contentObj.text;
+        }
+      }
+    }
+
+    // Fallback: choice.text (legacy completion format)
+    if (extractedText === undefined && typeof choice.text === "string") {
+      extractedText = choice.text;
+    }
+
+    // Fallback: choice.delta?.content
+    if (extractedText === undefined && choice.delta && typeof choice.delta === "object") {
+      const deltaObj = choice.delta as Record<string, unknown>;
+      if (typeof deltaObj.content === "string") {
+        extractedText = deltaObj.content;
+      }
+    }
+  }
+
+  // Fallback to top-level fields
+  if (extractedText === undefined) {
+    if (typeof payload.output_text === "string") {
+      extractedText = payload.output_text;
+    } else if (typeof payload.response === "string") {
+      extractedText = payload.response;
+    } else if (typeof payload.generated_text === "string") {
+      extractedText = payload.generated_text;
+    } else if (typeof payload.text === "string") {
+      extractedText = payload.text;
+    }
+  }
+
+  const finishReason =
+    (choice && typeof choice.finish_reason === "string" ? choice.finish_reason : undefined) ||
+    (typeof payload.finish_reason === "string" ? payload.finish_reason : undefined);
+
+  // Check for content filter / safety block
+  if (
+    finishReason &&
+    (finishReason.toLowerCase() === "content_filter" || finishReason.toLowerCase() === "safety") &&
+    (!extractedText || !extractedText.trim())
+  ) {
+    const err = new Error(
+      `Meta generation was filtered by safety policies (finish_reason: ${finishReason}).`
+    );
+    (err as unknown as { status: number; statusCode: number }).status = 502;
+    (err as unknown as { status: number; statusCode: number }).statusCode = 502;
+    throw err;
+  }
+
+  // Validate extracted text
+  if (!choices && extractedText === undefined) {
+    const err = new Error("Meta API response missing 'choices' array and alternative text fields.");
+    (err as unknown as { status: number; statusCode: number }).status = 502;
+    (err as unknown as { status: number; statusCode: number }).statusCode = 502;
+    throw err;
+  }
+
+  if (isNullContent && extractedText === undefined) {
+    const err = new Error("Meta returned null completion content.");
+    (err as unknown as { status: number; statusCode: number }).status = 502;
+    (err as unknown as { status: number; statusCode: number }).statusCode = 502;
+    throw err;
+  }
+
+  if (extractedText === undefined) {
+    const err = new Error("Meta returned a completion without text content.");
+    (err as unknown as { status: number; statusCode: number }).status = 502;
+    (err as unknown as { status: number; statusCode: number }).statusCode = 502;
+    throw err;
+  }
+
+  if (!extractedText.trim()) {
+    const err = new Error("Meta returned an empty completion string.");
+    (err as unknown as { status: number; statusCode: number }).status = 502;
+    (err as unknown as { status: number; statusCode: number }).statusCode = 502;
+    throw err;
+  }
+
+  const truncated =
+    typeof finishReason === "string" &&
+    (finishReason.trim().toLowerCase() === "length" ||
+      finishReason.trim().toLowerCase() === "max_tokens");
+
+  const rawUsage =
+    payload.usage && typeof payload.usage === "object"
+      ? (() => {
+          const u = payload.usage as Record<string, unknown>;
+          return {
+            promptTokens: typeof u.prompt_tokens === "number" ? u.prompt_tokens : undefined,
+            completionTokens: typeof u.completion_tokens === "number" ? u.completion_tokens : undefined,
+            totalTokens: typeof u.total_tokens === "number" ? u.total_tokens : undefined,
+          };
+        })()
+      : undefined;
+
+  return {
+    outputText: extractedText,
+    finishReason,
+    truncated,
+    rawUsage,
+  };
 }
 
 export class MetaProvider implements ModelProvider {
@@ -328,46 +541,13 @@ export class MetaProvider implements ModelProvider {
       throw parseErr;
     }
 
-    const choice = (data as {
-      choices?: Array<{
-        message?: { content?: string | null };
-        finish_reason?: string;
-      }>;
-    })?.choices?.[0];
-
-    const outputText = choice?.message?.content;
-
-    if (typeof outputText !== "string" || !outputText.trim()) {
-      const malformedErr = new Error("Meta returned an empty completion.");
-      (malformedErr as unknown as { status: number; statusCode: number }).status = 502;
-      (malformedErr as unknown as { status: number; statusCode: number }).statusCode = 502;
-      throw malformedErr;
-    }
-
-    const finishReason = choice?.finish_reason;
-    const truncated =
-      typeof finishReason === "string" &&
-      (finishReason.trim().toLowerCase() === "length" ||
-        finishReason.trim().toLowerCase() === "max_tokens");
-    const usage = (data as {
-      usage?: {
-        prompt_tokens?: number;
-        completion_tokens?: number;
-        total_tokens?: number;
-      };
-    })?.usage;
+    const extracted = extractTextFromMetaResponse(data);
 
     return {
-      outputText,
-      finishReason,
-      truncated,
-      rawUsage: usage
-        ? {
-            promptTokens: usage.prompt_tokens,
-            completionTokens: usage.completion_tokens,
-            totalTokens: usage.total_tokens,
-          }
-        : undefined,
+      outputText: extracted.outputText,
+      finishReason: extracted.finishReason,
+      truncated: extracted.truncated,
+      rawUsage: extracted.rawUsage,
     };
   }
 }
@@ -569,6 +749,12 @@ export function getErrorStatusCode(error: unknown): number {
 
   if (
     lowerMsg.includes("502") ||
+    lowerMsg.includes("empty completion") ||
+    lowerMsg.includes("null completion") ||
+    lowerMsg.includes("refused to generate") ||
+    lowerMsg.includes("filtered by safety") ||
+    lowerMsg.includes("missing 'choices' array") ||
+    lowerMsg.includes("unexpected meta api response structure") ||
     lowerMsg.includes("bad gateway") ||
     lowerMsg.includes("truncated due to") ||
     lowerMsg.includes("output token limits")

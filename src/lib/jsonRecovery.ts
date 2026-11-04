@@ -2,6 +2,7 @@ import ts from "typescript";
 import {
   type ModelRouter,
   type ModelProviderType,
+  isRetryableModelError,
 } from "./modelRouter";
 import { normalizeWorkspacePath } from "./agent/fileOps";
 import type { ConcurrencyLimiter } from "./rateLimiter";
@@ -1540,7 +1541,10 @@ export async function executeStagedGenerationPipeline(
 
     const output = result.response.outputText || "";
     if (!output || !output.trim()) {
-      throw new Error(`${lastUsedProvider} returned an empty completion.`);
+      const emptyErr = new Error(`${lastUsedProvider} returned an empty completion.`);
+      (emptyErr as unknown as { status: number; statusCode: number }).status = 502;
+      (emptyErr as unknown as { status: number; statusCode: number }).statusCode = 502;
+      throw emptyErr;
     }
     return output;
   }
@@ -1602,6 +1606,9 @@ Return ONLY valid JSON matching this schema:
       }
     }
   } catch (planErr) {
+    if (!isRetryableModelError(planErr)) {
+      throw planErr;
+    }
     console.warn(`[Req ${requestId}] Plan model call failed, falling back to default plan:`, planErr);
   }
 
@@ -1753,6 +1760,9 @@ Rules:
         }
       } catch (err) {
         console.warn(`[Req ${requestId}] Attempt ${retries + 1} for ${comp.path} failed:`, err);
+        if (!isRetryableModelError(err)) {
+          break;
+        }
       }
 
       if (!compSuccess) {
@@ -1781,7 +1791,7 @@ Return ONLY valid JSON:
     .map((f) => `- ${f.path}`)
     .join("\n");
 
-  const appPrompt = `Generate the main application file "App.tsx" for the application "${userPrompt}".
+  const baseAppPrompt = `Generate the main application file "App.tsx" for the application "${userPrompt}".
 
 Available components and files in the project:
 ${availableFilesSummary || "- (Single file application)"}
@@ -1804,13 +1814,40 @@ Rules:
   "dependencies": {}
 }`;
 
+  let currentAppPrompt = baseAppPrompt;
   let appGenerated = false;
   let appRetries = 0;
   let lastAppError = "";
+  let lastAppStatusCode: number | undefined;
 
   while (!appGenerated && appRetries <= maxComponentRetries) {
+    if (appRetries > 0) {
+      // Sensible bounded backoff delay before retry
+      await new Promise((resolve) => setTimeout(resolve, 300 * appRetries));
+
+      // Compact retry prompt without huge sharedContext to avoid hitting model context/token limits
+      currentAppPrompt = `Generate ONLY the main App.tsx file for "${userPrompt}".
+Available components to import:
+${availableFilesSummary || "- None"}
+
+Rules:
+- The file path must be "App.tsx" with "export default function App()".
+- Import and connect the available components cleanly.
+- Keep implementation clean, functional, and compact.
+- Return ONLY valid JSON:
+{
+  "files": [
+    {
+      "path": "App.tsx",
+      "code": "complete React TypeScript code"
+    }
+  ],
+  "dependencies": {}
+}`;
+    }
+
     try {
-      const output = await invokeModel(appPrompt);
+      const output = await invokeModel(currentAppPrompt);
       const parseStart = Date.now();
       const parsed = safeParseJson<GenerationOutput>(output);
       jsonParsingDurationMs += Date.now() - parseStart;
@@ -1828,7 +1865,11 @@ Rules:
           appGenerated = true;
         } else if (validated.error) {
           lastAppError = validated.error;
+          lastAppStatusCode = 400;
         }
+      } else if (!parsed.success && parsed.error) {
+        lastAppError = parsed.error;
+        lastAppStatusCode = 400;
       }
 
       if (!appGenerated) {
@@ -1843,14 +1884,30 @@ Rules:
       }
     } catch (err) {
       console.warn(`[Req ${requestId}] App.tsx generation attempt ${appRetries + 1} failed:`, err);
+      const errMsg = err instanceof Error ? err.message : String(err);
+      if (!lastAppError || !lastAppError.toLowerCase().includes("invalid typescript")) {
+        lastAppError = errMsg;
+      }
+      lastAppStatusCode =
+        (err as { status?: number; statusCode?: number })?.status ||
+        (err as { status?: number; statusCode?: number })?.statusCode;
+
+      if (!isRetryableModelError(err)) {
+        break;
+      }
     }
     appRetries++;
   }
 
   if (!accumulatedFiles.some((f) => f.path === "App.tsx" || f.path.endsWith("/App.tsx"))) {
-    throw new Error(
+    const finalErr = new Error(
       lastAppError || `${lastUsedProvider} failed to generate a valid App.tsx.`
     );
+    if (lastAppStatusCode) {
+      (finalErr as unknown as { status: number; statusCode: number }).status = lastAppStatusCode;
+      (finalErr as unknown as { status: number; statusCode: number }).statusCode = lastAppStatusCode;
+    }
+    throw finalErr;
   }
 
   // --- STAGE 5: VALIDATE & REPAIR MISSING IMPORTS ---
