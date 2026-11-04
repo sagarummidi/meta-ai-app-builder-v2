@@ -1013,6 +1013,11 @@ export interface PipelineExecutionOptions {
   maxContinuationAttempts?: number;
   concurrencyLimiter?: ConcurrencyLimiter;
   timeoutMs?: number;
+  onProgress?: (
+    stageMessage: string,
+    progressPercent: number,
+    completedFiles: GeneratedFile[]
+  ) => void;
 }
 
 export interface PipelineExecutionResult {
@@ -1043,6 +1048,7 @@ export async function executeGenerationPipeline(
     maxContinuationAttempts = 2,
     concurrencyLimiter,
     timeoutMs,
+    onProgress,
   } = options;
 
   const startPipelineTime = Date.now();
@@ -1103,6 +1109,11 @@ Rules:
     attempt++;
     console.log(
       `[Req ${requestId}] Generation turn ${attempt}/${maxAttempts} (${provider}, model: ${model})...`
+    );
+    onProgress?.(
+      `Generating application components (turn ${attempt}/${maxAttempts})...`,
+      Math.min(85, 15 + attempt * 25),
+      accumulatedFiles
     );
 
     const callStartTime = Date.now();
@@ -1349,11 +1360,12 @@ Rules:
         missingSet.add(m.missingPath);
       }
 
+      const missingArray = Array.from(missingSet);
+      // Prioritize at most 2 missing files at a time to prevent output token limit exhaustion
+      const targetMissing = missingArray.slice(0, 2);
       const missingList =
-        missingSet.size > 0
-          ? Array.from(missingSet)
-              .map((p) => `- ${p}`)
-              .join("\n")
+        targetMissing.length > 0
+          ? targetMissing.map((p) => `- ${p}`).join("\n")
           : "- App.tsx";
 
       const importContext =
@@ -1416,4 +1428,513 @@ Return ONLY valid JSON:
   throw new Error(
     `${lastUsedProvider} failed to generate a complete application.`
   );
+}
+
+export interface PlannedFile {
+  path: string;
+  purpose: string;
+}
+
+export interface ApplicationPlan {
+  plan: string;
+  files: PlannedFile[];
+  dependencies: Record<string, string>;
+}
+
+export interface StagedPipelineOptions {
+  modelRouter: ModelRouter;
+  provider: ModelProviderType;
+  model: string;
+  userPrompt: string;
+  requestId: string;
+  disableFallback?: boolean;
+  concurrencyLimiter?: ConcurrencyLimiter;
+  timeoutMs?: number;
+  onProgress?: (
+    stageMessage: string,
+    progressPercent: number,
+    completedFiles: GeneratedFile[]
+  ) => void;
+  maxComponentRetries?: number;
+}
+
+/**
+ * Executes a controlled staged generation pipeline for multi-file applications:
+ * 1. Plan application architecture and file manifest (compact call, ~200-400 tokens)
+ * 2. Generate shared types, models and configurations
+ * 3. Generate individual components one-by-one with type context (small bounded calls)
+ * 4. Generate the main application entry point (App.tsx)
+ * 5. Validate TypeScript syntax and resolve relative imports
+ * 6. Target repair for any missing or broken local files
+ */
+export async function executeStagedGenerationPipeline(
+  options: StagedPipelineOptions
+): Promise<PipelineExecutionResult> {
+  const {
+    modelRouter,
+    provider,
+    model,
+    userPrompt,
+    requestId,
+    disableFallback,
+    concurrencyLimiter,
+    timeoutMs,
+    onProgress,
+    maxComponentRetries = 1,
+  } = options;
+
+  const startPipelineTime = Date.now();
+  let initialRequestDurationMs = 0;
+  let continuationDurationMs = 0;
+  let jsonParsingDurationMs = 0;
+  let syntaxValidationDurationMs = 0;
+  let modelCallsCount = 0;
+
+  let accumulatedFiles: GeneratedFile[] = [];
+  const accumulatedDeps: Record<string, string> = {};
+  let lastUsedModel = model;
+  let lastUsedProvider = provider;
+  let fallbackUsed = false;
+  let fallbackNotice: string | undefined;
+
+  async function invokeModel(promptText: string): Promise<string> {
+    const callStartTime = Date.now();
+    modelCallsCount++;
+
+    const modelCallFn = () =>
+      modelRouter.generateWithFallback(
+        {
+          model,
+          input: promptText,
+          generationConfig: {
+            thinking_level: "low",
+          },
+          responseFormat: {
+            type: "text",
+            mime_type: "application/json",
+          },
+          requestId,
+          disableFallback,
+          timeoutMs,
+        },
+        provider
+      );
+
+    const result = concurrencyLimiter
+      ? await concurrencyLimiter.execute(modelCallFn)
+      : await modelCallFn();
+
+    const callDuration = Date.now() - callStartTime;
+    if (modelCallsCount === 1) {
+      initialRequestDurationMs = callDuration;
+    } else {
+      continuationDurationMs += callDuration;
+    }
+
+    lastUsedModel = result.usedModel;
+    lastUsedProvider = result.usedProvider;
+    if (result.fallbackUsed) {
+      fallbackUsed = true;
+      fallbackNotice = result.fallbackNotice;
+    }
+
+    const output = result.response.outputText || "";
+    if (!output || !output.trim()) {
+      throw new Error(`${lastUsedProvider} returned an empty completion.`);
+    }
+    return output;
+  }
+
+  // --- STAGE 1: PLAN APPLICATION ARCHITECTURE ---
+  onProgress?.("Planning application architecture...", 10, accumulatedFiles);
+
+  const planPrompt = `Plan a React TypeScript application based on this request:
+"${userPrompt}"
+
+Provide a clean, focused, modular architectural plan with 2 to 5 files:
+1. "types.ts" (if domain models or interfaces are needed)
+2. 1 to 3 focused component files (e.g. "components/ExpenseForm.tsx", "components/ExpenseList.tsx")
+3. "App.tsx" (the main root application component that imports and connects them)
+
+Keep the plan clean, realistic, and modular. Do not over-engineer with too many files.
+
+Return ONLY valid JSON matching this schema:
+{
+  "plan": "Short description of the app design",
+  "files": [
+    { "path": "types.ts", "purpose": "Type definitions for data models" },
+    { "path": "components/ExpenseForm.tsx", "purpose": "Form to add items" },
+    { "path": "App.tsx", "purpose": "Main application layout and state" }
+  ],
+  "dependencies": {
+    "lucide-react": "latest"
+  }
+}`;
+
+  let plannedFiles: PlannedFile[] = [];
+
+  try {
+    const planOutput = await invokeModel(planPrompt);
+    const parseStart = Date.now();
+    const parsedPlan = safeParseJson<ApplicationPlan>(planOutput);
+    jsonParsingDurationMs += Date.now() - parseStart;
+
+    if (parsedPlan.success && parsedPlan.data?.files && Array.isArray(parsedPlan.data.files)) {
+      for (const item of parsedPlan.data.files) {
+        if (!item || typeof item.path !== "string") continue;
+        try {
+          const norm = normalizeWorkspacePath(item.path);
+          plannedFiles.push({
+            path: norm,
+            purpose: typeof item.purpose === "string" ? item.purpose : "Component",
+          });
+        } catch {
+          // ignore invalid path
+        }
+      }
+
+      if (parsedPlan.data.dependencies && typeof parsedPlan.data.dependencies === "object") {
+        for (const [k, v] of Object.entries(parsedPlan.data.dependencies)) {
+          if (typeof k === "string" && /^[a-zA-Z0-9@_./-]+$/.test(k.trim())) {
+            accumulatedDeps[k.trim()] = typeof v === "string" ? v : "latest";
+          }
+        }
+      }
+    }
+  } catch (planErr) {
+    console.warn(`[Req ${requestId}] Plan model call failed, falling back to default plan:`, planErr);
+  }
+
+  // Ensure App.tsx exists in planned files
+  const hasAppInPlan = plannedFiles.some(
+    (f) => f.path === "App.tsx" || f.path.endsWith("/App.tsx")
+  );
+  if (!hasAppInPlan) {
+    plannedFiles.push({
+      path: "App.tsx",
+      purpose: "Main root application entry point",
+    });
+  }
+
+  // Deduplicate and cap at 5 files
+  const seenPaths = new Set<string>();
+  const uniquePlanned: PlannedFile[] = [];
+  for (const pf of plannedFiles) {
+    if (!seenPaths.has(pf.path)) {
+      seenPaths.add(pf.path);
+      uniquePlanned.push(pf);
+    }
+  }
+  plannedFiles = uniquePlanned.slice(0, 5);
+
+  // Group files: shared (types, utils, config), components, and entry point (App.tsx)
+  const sharedFiles = plannedFiles.filter(
+    (f) =>
+      f.path !== "App.tsx" &&
+      (f.path === "types.ts" ||
+        f.path.includes("types") ||
+        f.path.includes("util") ||
+        f.path.includes("config"))
+  );
+
+  const componentFiles = plannedFiles.filter(
+    (f) =>
+      f.path !== "App.tsx" &&
+      !sharedFiles.some((sf) => sf.path === f.path)
+  );
+
+  // --- STAGE 2: GENERATE SHARED TYPES & UTILITIES ---
+  for (let i = 0; i < sharedFiles.length; i++) {
+    const file = sharedFiles[i];
+    const progress = 20 + Math.round(((i + 1) / (sharedFiles.length + 1)) * 15);
+    onProgress?.(`Generating shared file: ${file.path}...`, progress, accumulatedFiles);
+
+    const sharedPrompt = `Generate the following shared file for the React TypeScript application "${userPrompt}":
+Path: "${file.path}"
+Purpose: "${file.purpose}"
+
+Return ONLY valid JSON:
+{
+  "files": [
+    {
+      "path": "${file.path}",
+      "code": "complete TypeScript code"
+    }
+  ],
+  "dependencies": {}
+}`;
+
+    try {
+      const output = await invokeModel(sharedPrompt);
+      const parseStart = Date.now();
+      const parsed = safeParseJson<GenerationOutput>(output);
+      jsonParsingDurationMs += Date.now() - parseStart;
+
+      if (parsed.success && parsed.data?.files) {
+        const valStart = Date.now();
+        const validated = validateGenerationOutput(parsed.data);
+        syntaxValidationDurationMs += Date.now() - valStart;
+
+        if (validated.valid && validated.files && validated.files.length > 0) {
+          accumulatedFiles = mergeGeneratedFiles(accumulatedFiles, validated.files);
+          if (validated.dependencies) {
+            Object.assign(accumulatedDeps, validated.dependencies);
+          }
+        }
+      }
+    } catch (sharedErr) {
+      console.warn(`[Req ${requestId}] Failed to generate shared file ${file.path}:`, sharedErr);
+    }
+  }
+
+  // --- STAGE 3: GENERATE INDIVIDUAL COMPONENTS ---
+  const sharedContext = accumulatedFiles
+    .filter((f) => f.path.endsWith(".ts"))
+    .map((f) => `// File: ${f.path}\n${f.code}`)
+    .join("\n\n");
+
+  for (let i = 0; i < componentFiles.length; i++) {
+    const comp = componentFiles[i];
+    const progress = 35 + Math.round(((i + 1) / (componentFiles.length + 1)) * 40);
+    onProgress?.(`Generating component: ${comp.path}...`, progress, accumulatedFiles);
+
+    let compPrompt = `Generate the component "${comp.path}" for the application "${userPrompt}".
+Purpose: "${comp.purpose}"
+
+${sharedContext ? `Existing types and shared interfaces in the project:\n${sharedContext}\n` : ""}
+Rules:
+- Export the component cleanly.
+- Use React and TypeScript.
+- The component must actually work and have complete, functional code.
+- Keep the code concise, modular, and modern (e.g. use "lucide-react" for icons).
+- Return ONLY valid JSON:
+{
+  "files": [
+    {
+      "path": "${comp.path}",
+      "code": "complete React component code"
+    }
+  ],
+  "dependencies": {}
+}`;
+
+    let compSuccess = false;
+    let retries = 0;
+
+    while (!compSuccess && retries <= maxComponentRetries) {
+      try {
+        const output = await invokeModel(compPrompt);
+        const parseStart = Date.now();
+        const parsed = safeParseJson<GenerationOutput>(output);
+        jsonParsingDurationMs += Date.now() - parseStart;
+
+        if (parsed.success && parsed.data?.files) {
+          const valStart = Date.now();
+          const validated = validateGenerationOutput(parsed.data);
+          syntaxValidationDurationMs += Date.now() - valStart;
+
+          if (validated.valid && validated.files && validated.files.length > 0) {
+            accumulatedFiles = mergeGeneratedFiles(accumulatedFiles, validated.files);
+            if (validated.dependencies) {
+              Object.assign(accumulatedDeps, validated.dependencies);
+            }
+            compSuccess = true;
+          }
+        }
+
+        if (!compSuccess) {
+          // Check if partial file extraction works
+          const recovered = extractCompleteFilesFromTruncatedJson(output);
+          const compRecovered = recovered.find((f) => f.path === comp.path);
+          if (compRecovered) {
+            accumulatedFiles = mergeGeneratedFiles(accumulatedFiles, [compRecovered]);
+            compSuccess = true;
+          }
+        }
+      } catch (err) {
+        console.warn(`[Req ${requestId}] Attempt ${retries + 1} for ${comp.path} failed:`, err);
+      }
+
+      if (!compSuccess) {
+        retries++;
+        compPrompt = `The previous attempt for "${comp.path}" was truncated or invalid.
+Generate a concise, clean, working implementation of "${comp.path}" for "${userPrompt}".
+Keep code compact to ensure it stays well within output token limits.
+Return ONLY valid JSON:
+{
+  "files": [
+    {
+      "path": "${comp.path}",
+      "code": "complete React component code"
+    }
+  ],
+  "dependencies": {}
+}`;
+      }
+    }
+  }
+
+  // --- STAGE 4: GENERATE MAIN APPLICATION ENTRY POINT (App.tsx) ---
+  onProgress?.("Generating main application entry point (App.tsx)...", 80, accumulatedFiles);
+
+  const availableFilesSummary = accumulatedFiles
+    .map((f) => `- ${f.path}`)
+    .join("\n");
+
+  const appPrompt = `Generate the main application file "App.tsx" for the application "${userPrompt}".
+
+Available components and files in the project:
+${availableFilesSummary || "- (Single file application)"}
+
+${sharedContext ? `Existing types:\n${sharedContext}\n` : ""}
+Rules:
+- The main file must be App.tsx.
+- Default export must be the App component: export default function App().
+- Import and render the available components.
+- Manage root application state and user interactions cleanly.
+- Use React and TypeScript.
+- Return ONLY valid JSON:
+{
+  "files": [
+    {
+      "path": "App.tsx",
+      "code": "complete React TypeScript code"
+    }
+  ],
+  "dependencies": {}
+}`;
+
+  let appGenerated = false;
+  let appRetries = 0;
+  let lastAppError = "";
+
+  while (!appGenerated && appRetries <= maxComponentRetries) {
+    try {
+      const output = await invokeModel(appPrompt);
+      const parseStart = Date.now();
+      const parsed = safeParseJson<GenerationOutput>(output);
+      jsonParsingDurationMs += Date.now() - parseStart;
+
+      if (parsed.success && parsed.data?.files) {
+        const valStart = Date.now();
+        const validated = validateGenerationOutput(parsed.data);
+        syntaxValidationDurationMs += Date.now() - valStart;
+
+        if (validated.valid && validated.files && validated.files.length > 0) {
+          accumulatedFiles = mergeGeneratedFiles(accumulatedFiles, validated.files);
+          if (validated.dependencies) {
+            Object.assign(accumulatedDeps, validated.dependencies);
+          }
+          appGenerated = true;
+        } else if (validated.error) {
+          lastAppError = validated.error;
+        }
+      }
+
+      if (!appGenerated) {
+        const recovered = extractCompleteFilesFromTruncatedJson(output);
+        const appRecovered = recovered.find(
+          (f) => f.path === "App.tsx" || f.path.endsWith("/App.tsx")
+        );
+        if (appRecovered) {
+          accumulatedFiles = mergeGeneratedFiles(accumulatedFiles, [appRecovered]);
+          appGenerated = true;
+        }
+      }
+    } catch (err) {
+      console.warn(`[Req ${requestId}] App.tsx generation attempt ${appRetries + 1} failed:`, err);
+    }
+    appRetries++;
+  }
+
+  if (!accumulatedFiles.some((f) => f.path === "App.tsx" || f.path.endsWith("/App.tsx"))) {
+    throw new Error(
+      lastAppError || `${lastUsedProvider} failed to generate a valid App.tsx.`
+    );
+  }
+
+  // --- STAGE 5: VALIDATE & REPAIR MISSING IMPORTS ---
+  onProgress?.("Validating application syntax and relative imports...", 90, accumulatedFiles);
+
+  const missingImports = findMissingLocalImports(accumulatedFiles);
+  if (missingImports.length > 0) {
+    // Repair up to 2 missing files individually
+    const toRepair = missingImports.slice(0, 2);
+    for (const missing of toRepair) {
+      onProgress?.(
+        `Generating missing component: ${missing.missingPath}...`,
+        95,
+        accumulatedFiles
+      );
+
+      const repairPrompt = `Generate the missing component "${missing.missingPath}" required by "${missing.importedBy}".
+Import statement in existing code:
+"${missing.importStatement}"
+
+Task:
+Build a complete React TypeScript component for "${missing.missingPath}".
+Return ONLY valid JSON:
+{
+  "files": [
+    {
+      "path": "${missing.missingPath}",
+      "code": "complete code"
+    }
+  ],
+  "dependencies": {}
+}`;
+
+      try {
+        const repairOutput = await invokeModel(repairPrompt);
+        const parsed = safeParseJson<GenerationOutput>(repairOutput);
+        if (parsed.success && parsed.data?.files) {
+          const validated = validateGenerationOutput(parsed.data);
+          if (validated.valid && validated.files) {
+            accumulatedFiles = mergeGeneratedFiles(accumulatedFiles, validated.files);
+            if (validated.dependencies) {
+              Object.assign(accumulatedDeps, validated.dependencies);
+            }
+          }
+        }
+      } catch (repairErr) {
+        console.warn(`[Req ${requestId}] Failed to repair missing import ${missing.missingPath}:`, repairErr);
+      }
+    }
+  }
+
+  // Final syntax verification
+  const finalValStart = Date.now();
+  const finalSyntaxErr = findFirstSyntaxError(accumulatedFiles);
+  syntaxValidationDurationMs += Date.now() - finalValStart;
+
+  if (finalSyntaxErr) {
+    throw new Error(
+      `${lastUsedProvider} generated invalid TypeScript (${finalSyntaxErr}).`
+    );
+  }
+
+  onProgress?.("Application generation completed successfully.", 100, accumulatedFiles);
+
+  const totalDurationMs = Date.now() - startPipelineTime;
+  const timings: PipelineTimingInfo = {
+    totalDurationMs,
+    initialRequestDurationMs,
+    continuationDurationMs,
+    jsonParsingDurationMs,
+    syntaxValidationDurationMs,
+    modelCallsCount,
+    recoveredFilesCount: accumulatedFiles.length,
+    finalFilesCount: accumulatedFiles.length,
+  };
+
+  return {
+    files: accumulatedFiles,
+    dependencies: accumulatedDeps,
+    usedModel: lastUsedModel,
+    usedProvider: lastUsedProvider,
+    fallbackUsed,
+    fallbackNotice,
+    attemptsUsed: modelCallsCount,
+    timings,
+  };
 }

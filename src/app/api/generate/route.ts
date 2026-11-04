@@ -11,12 +11,82 @@ import {
   type IRateLimiter,
   type ConcurrencyLimiter,
 } from "@/lib/rateLimiter";
-import { executeGenerationPipeline } from "@/lib/jsonRecovery";
+import {
+  executeGenerationPipeline,
+  executeStagedGenerationPipeline,
+} from "@/lib/jsonRecovery";
+import { globalJobStore } from "@/lib/generationJobs";
 
 export const maxDuration = 300;
 export const dynamic = "force-dynamic";
 
 const MAX_PROMPT_LENGTH = 15000;
+
+export async function GET(request: Request) {
+  const url = new URL(request.url);
+  const jobId = url.searchParams.get("jobId");
+
+  if (!jobId || !jobId.trim()) {
+    return NextResponse.json(
+      { success: false, message: "Missing required 'jobId' parameter." },
+      { status: 400 }
+    );
+  }
+
+  const job = globalJobStore.getJob(jobId.trim());
+  if (!job) {
+    return NextResponse.json(
+      {
+        success: false,
+        message: "Generation job not found or has expired.",
+      },
+      { status: 404 }
+    );
+  }
+
+  if (job.status === "failed") {
+    return NextResponse.json(
+      {
+        success: false,
+        jobId: job.id,
+        status: job.status,
+        stageMessage: job.stageMessage,
+        error: job.error,
+        message: job.error || "Generation job failed.",
+      },
+      { status: job.statusCode || 500 }
+    );
+  }
+
+  if (job.status === "completed" && job.result) {
+    return NextResponse.json({
+      success: true,
+      jobId: job.id,
+      status: job.status,
+      stageMessage: job.stageMessage,
+      progressPercent: 100,
+      completedFilePaths: job.completedFilePaths,
+      prompt: job.prompt,
+      generatedCode: job.result.generatedCode,
+      files: job.result.files,
+      dependencies: job.result.dependencies,
+      usedModel: job.result.usedModel,
+      usedProvider: job.result.usedProvider,
+      fallbackUsed: job.result.fallbackUsed,
+      fallbackNotice: job.result.fallbackNotice,
+      timings: job.result.timings,
+    });
+  }
+
+  return NextResponse.json({
+    success: true,
+    jobId: job.id,
+    status: job.status,
+    stageMessage: job.stageMessage,
+    progressPercent: job.progressPercent,
+    completedFilePaths: job.completedFilePaths,
+  });
+}
 
 export async function POST(request: Request, context?: unknown) {
   const serverReqId = Math.random().toString(36).substring(2, 10);
@@ -114,9 +184,75 @@ export async function POST(request: Request, context?: unknown) {
       );
     }
 
-    console.log(`[Req ${reqId}] Calling ModelRouter (${providerType}, model: ${modelToUse}) with recovery pipeline...`);
-
     const activeConcurrencyLimiter = injectedConcurrencyLimiter || defaultConcurrencyLimiter;
+    const rawMode = typeof body.mode === "string" ? body.mode.trim().toLowerCase() : "";
+    const isAsyncMode = rawMode === "async" || (rawMode !== "sync" && process.env.NODE_ENV !== "test");
+
+    if (isAsyncMode) {
+      const job = globalJobStore.createJob(reqId, prompt, providerType, modelToUse);
+
+      (async () => {
+        try {
+          globalJobStore.updateJobProgress(reqId, {
+            status: "planning",
+            stageMessage: "Planning application architecture...",
+            progressPercent: 10,
+          });
+
+          const pipelineResult = await executeStagedGenerationPipeline({
+            modelRouter,
+            provider: providerType,
+            model: modelToUse,
+            userPrompt: prompt,
+            requestId: reqId,
+            disableFallback: true,
+            concurrencyLimiter: activeConcurrencyLimiter,
+            onProgress: (stageMessage, progressPercent, completedFiles) => {
+              globalJobStore.updateJobProgress(reqId, {
+                status: "generating_components",
+                stageMessage,
+                progressPercent,
+                completedFilePaths: completedFiles.map((f) => f.path),
+              });
+            },
+          });
+
+          const validFiles = pipelineResult.files;
+          const mainFile =
+            validFiles.find(
+              (file) => file.path === "App.tsx" || file.path.endsWith("/App.tsx")
+            ) ||
+            validFiles.find((file) => file.path === "page.tsx") ||
+            validFiles[0];
+
+          globalJobStore.completeJob(reqId, {
+            files: validFiles,
+            dependencies: pipelineResult.dependencies,
+            generatedCode: mainFile?.code || "",
+            usedModel: pipelineResult.usedModel,
+            usedProvider: pipelineResult.usedProvider,
+            fallbackUsed: pipelineResult.fallbackUsed,
+            fallbackNotice: pipelineResult.fallbackNotice,
+            timings: pipelineResult.timings,
+          });
+        } catch (jobErr) {
+          const statusCode = getErrorStatusCode(jobErr);
+          const rawMessage = jobErr instanceof Error ? jobErr.message : "Unknown generation error.";
+          const safeMessage = sanitizeErrorMessage(rawMessage);
+          globalJobStore.failJob(reqId, safeMessage, statusCode);
+        }
+      })();
+
+      return NextResponse.json({
+        success: true,
+        requestId: reqId,
+        jobId: job.id,
+        status: "pending",
+        message: "Application generation job started",
+      });
+    }
+
+    console.log(`[Req ${reqId}] Calling ModelRouter (${providerType}, model: ${modelToUse}) with recovery pipeline (sync mode)...`);
 
     const pipelineResult = await executeGenerationPipeline({
       modelRouter,

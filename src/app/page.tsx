@@ -308,6 +308,8 @@ export default function Home() {
   const [fallbackNotice, setFallbackNotice] = useState<string | null>(null);
   const [generationError, setGenerationError] = useState<string | null>(null);
   const [generationElapsed, setGenerationElapsed] = useState(0);
+  const [generationStageMessage, setGenerationStageMessage] = useState<string | null>(null);
+  const [generationProgressPercent, setGenerationProgressPercent] = useState<number | null>(null);
 
   useEffect(() => {
     if (!loading) return;
@@ -318,6 +320,10 @@ export default function Home() {
   }, [loading]);
 
   function getGenerationProgressMessage(): string {
+    if (generationStageMessage) {
+      const pctStr = typeof generationProgressPercent === "number" ? ` [${generationProgressPercent}%]` : "";
+      return `${generationStageMessage}${pctStr} (${generationElapsed}s)`;
+    }
     if (generationElapsed < 5) {
       return "Connecting to Meta provider and initializing generation...";
     } else if (generationElapsed < 25) {
@@ -865,6 +871,8 @@ export default function Home() {
     isGeneratingRef.current = true;
     setLoading(true);
     setGenerationElapsed(0);
+    setGenerationStageMessage(null);
+    setGenerationProgressPercent(null);
     setGenerationError(null);
     setRepairSuccess(null);
     setRepairError(null);
@@ -886,6 +894,7 @@ export default function Home() {
             provider: selectedProvider,
             model: selectedModel,
             requestId: reqId,
+            mode: "async",
           }),
         });
       } catch (fetchErr) {
@@ -916,6 +925,73 @@ export default function Home() {
         throw new Error(
           data.message || `Failed to generate the app (HTTP ${response.status}).`
         );
+      }
+
+      // If backend returned an async generation job, poll until completion
+      if (data && typeof data === "object" && typeof (data as { jobId?: unknown }).jobId === "string") {
+        const activeJobId = (data as { jobId: string }).jobId;
+        let jobCompleted = false;
+        let pollAttempts = 0;
+        const maxPollAttempts = 300;
+        let consecutiveNetworkErrors = 0;
+
+        while (!jobCompleted && pollAttempts < maxPollAttempts) {
+          await new Promise((resolve) => setTimeout(resolve, 1500));
+          pollAttempts++;
+
+          let pollRes: Response;
+          try {
+            pollRes = await fetch(`/api/generate?jobId=${encodeURIComponent(activeJobId)}`);
+            consecutiveNetworkErrors = 0;
+          } catch (pollErr) {
+            consecutiveNetworkErrors++;
+            if (consecutiveNetworkErrors > 5) {
+              throw new Error(
+                `Lost connection to server while polling generation status (${
+                  pollErr instanceof Error ? pollErr.message : "network failure"
+                }).`
+              );
+            }
+            continue;
+          }
+
+          const pollText = await pollRes.text();
+          if (!pollText.trim()) continue;
+
+          let pollData: Record<string, unknown>;
+          try {
+            pollData = JSON.parse(pollText);
+          } catch {
+            continue;
+          }
+
+          if (!pollRes.ok || pollData.success === false) {
+            throw new Error(
+              typeof pollData.message === "string"
+                ? pollData.message
+                : typeof pollData.error === "string"
+                ? pollData.error
+                : `Generation failed (HTTP ${pollRes.status}).`
+            );
+          }
+
+          if (pollData.status === "completed") {
+            data = pollData;
+            jobCompleted = true;
+            break;
+          }
+
+          if (typeof pollData.stageMessage === "string" && pollData.stageMessage) {
+            setGenerationStageMessage(pollData.stageMessage);
+          }
+          if (typeof pollData.progressPercent === "number") {
+            setGenerationProgressPercent(pollData.progressPercent);
+          }
+        }
+
+        if (!jobCompleted) {
+          throw new Error("Generation timed out on client polling.");
+        }
       }
 
       if (data.fallbackNotice) {
@@ -992,6 +1068,8 @@ export default function Home() {
     } finally {
       isGeneratingRef.current = false;
       setLoading(false);
+      setGenerationStageMessage(null);
+      setGenerationProgressPercent(null);
     }
   }
 
@@ -1029,6 +1107,8 @@ export default function Home() {
     isGeneratingRef.current = true;
     setLoading(true);
     setGenerationElapsed(0);
+    setGenerationStageMessage(null);
+    setGenerationProgressPercent(null);
     setGenerationError(null);
     setRepairSuccess(null);
     setRepairError(null);
@@ -1050,6 +1130,7 @@ export default function Home() {
             provider: selectedProvider,
             model: selectedModel,
             requestId: reqId,
+            mode: "async",
           }),
         });
       } catch (fetchErr) {
@@ -1076,6 +1157,73 @@ export default function Home() {
 
       if (!response.ok || !data.success) {
         throw new Error(data.message || `Failed to regenerate the app (HTTP ${response.status}).`);
+      }
+
+      // If backend returned an async generation job, poll until completion
+      if (data && typeof data === "object" && typeof (data as { jobId?: unknown }).jobId === "string") {
+        const activeJobId = (data as { jobId: string }).jobId;
+        let jobCompleted = false;
+        let pollAttempts = 0;
+        const maxPollAttempts = 300;
+        let consecutiveNetworkErrors = 0;
+
+        while (!jobCompleted && pollAttempts < maxPollAttempts) {
+          await new Promise((resolve) => setTimeout(resolve, 1500));
+          pollAttempts++;
+
+          let pollRes: Response;
+          try {
+            pollRes = await fetch(`/api/generate?jobId=${encodeURIComponent(activeJobId)}`);
+            consecutiveNetworkErrors = 0;
+          } catch (pollErr) {
+            consecutiveNetworkErrors++;
+            if (consecutiveNetworkErrors > 5) {
+              throw new Error(
+                `Lost connection to server while polling generation status (${
+                  pollErr instanceof Error ? pollErr.message : "network failure"
+                }).`
+              );
+            }
+            continue;
+          }
+
+          const pollText = await pollRes.text();
+          if (!pollText.trim()) continue;
+
+          let pollData: Record<string, unknown>;
+          try {
+            pollData = JSON.parse(pollText);
+          } catch {
+            continue;
+          }
+
+          if (!pollRes.ok || pollData.success === false) {
+            throw new Error(
+              typeof pollData.message === "string"
+                ? pollData.message
+                : typeof pollData.error === "string"
+                ? pollData.error
+                : `Generation failed (HTTP ${pollRes.status}).`
+            );
+          }
+
+          if (pollData.status === "completed") {
+            data = pollData;
+            jobCompleted = true;
+            break;
+          }
+
+          if (typeof pollData.stageMessage === "string" && pollData.stageMessage) {
+            setGenerationStageMessage(pollData.stageMessage);
+          }
+          if (typeof pollData.progressPercent === "number") {
+            setGenerationProgressPercent(pollData.progressPercent);
+          }
+        }
+
+        if (!jobCompleted) {
+          throw new Error("Generation timed out on client polling.");
+        }
       }
 
       if (data.fallbackNotice) {
@@ -1152,6 +1300,8 @@ export default function Home() {
     } finally {
       isGeneratingRef.current = false;
       setLoading(false);
+      setGenerationStageMessage(null);
+      setGenerationProgressPercent(null);
     }
   }
 
