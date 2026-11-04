@@ -758,6 +758,18 @@ export function getErrorStatusCode(error: unknown): number {
   }
 
   if (
+    lowerMsg.includes("504") ||
+    lowerMsg.includes("gateway timeout") ||
+    lowerMsg.includes("timed out") ||
+    lowerMsg.includes("timeout") ||
+    lowerMsg.includes("maximum allowed duration") ||
+    lowerMsg.includes("took too long to complete")
+  ) {
+    return 504;
+  }
+
+  // Client errors (400 Bad Request)
+  if (
     lowerMsg.includes("invalid model") ||
     lowerMsg.includes("not available or registered") ||
     lowerMsg.includes("is not valid or available") ||
@@ -765,38 +777,37 @@ export function getErrorStatusCode(error: unknown): number {
     lowerMsg.includes("is not registered") ||
     lowerMsg.includes("please provide") ||
     lowerMsg.includes("bad request") ||
-    lowerMsg.includes("invalid json") ||
-    lowerMsg.includes("exceeds maximum allowed length") ||
-    lowerMsg.includes("empty project") ||
-    lowerMsg.includes("no valid files") ||
-    lowerMsg.includes("did not return a valid") ||
-    lowerMsg.includes("did not return valid json") ||
-    lowerMsg.includes("malformed json") ||
-    lowerMsg.includes("400")
+    lowerMsg.includes("invalid json request body") ||
+    lowerMsg.includes("exceeds maximum allowed length")
   ) {
     return 400;
   }
 
-  if (
-    lowerMsg.includes("504") ||
-    lowerMsg.includes("gateway timeout") ||
-    lowerMsg.includes("timed out") ||
-    lowerMsg.includes("timeout")
-  ) {
-    return 504;
-  }
-
+  // Upstream model/provider generation failures (502 Bad Gateway)
   if (
     lowerMsg.includes("502") ||
+    lowerMsg.includes("bad gateway") ||
     lowerMsg.includes("empty completion") ||
     lowerMsg.includes("null completion") ||
     lowerMsg.includes("refused to generate") ||
+    lowerMsg.includes("refusal") ||
     lowerMsg.includes("filtered by safety") ||
+    lowerMsg.includes("content_filter") ||
     lowerMsg.includes("missing 'choices' array") ||
     lowerMsg.includes("unexpected meta api response structure") ||
-    lowerMsg.includes("bad gateway") ||
     lowerMsg.includes("truncated due to") ||
-    lowerMsg.includes("output token limits")
+    lowerMsg.includes("output token limits") ||
+    lowerMsg.includes("token limits") ||
+    lowerMsg.includes("unterminated string in json") ||
+    lowerMsg.includes("failed to parse json") ||
+    lowerMsg.includes("malformed json") ||
+    lowerMsg.includes("did not return valid json") ||
+    lowerMsg.includes("did not return a valid") ||
+    lowerMsg.includes("no valid files") ||
+    lowerMsg.includes("empty project") ||
+    lowerMsg.includes("generated invalid typescript") ||
+    lowerMsg.includes("syntactically invalid") ||
+    lowerMsg.includes("failed to generate a valid")
   ) {
     return 502;
   }

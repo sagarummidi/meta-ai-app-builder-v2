@@ -4,7 +4,9 @@ import {
   type ModelProviderType,
   isRetryableModelError,
   DEFAULT_PROVIDER_TIMEOUT_MS,
+  sanitizeErrorMessage,
 } from "./modelRouter";
+import type { GenerationJobStatus } from "./generationJobs";
 import { normalizeWorkspacePath } from "./agent/fileOps";
 import type { ConcurrencyLimiter } from "./rateLimiter";
 
@@ -29,6 +31,7 @@ export interface ExtractedJsonResult<T = unknown> {
   rawJson?: string;
   isTruncated: boolean;
   error?: string;
+  truncatedPosition?: number;
 }
 
 /**
@@ -149,6 +152,82 @@ export function isFinishReasonTruncated(finishReason?: string | null): boolean {
  * Prioritizes fences containing the expected application structure when multiple fences exist.
  * Also determines whether the JSON is structurally truncated (unclosed braces, brackets, or strings).
  */
+export interface JsonStructureScan {
+  firstBraceIndex: number;
+  endIndex: number;
+  isTruncated: boolean;
+  truncatedInString: boolean;
+  truncatedPosition: number;
+  braceDepth: number;
+  bracketDepth: number;
+}
+
+/**
+ * Robust string-aware scanner that finds root object boundaries and structural truncation.
+ */
+export function scanJsonStructure(targetText: string): JsonStructureScan {
+  const firstBraceIndex = targetText.indexOf("{");
+  if (firstBraceIndex === -1) {
+    return {
+      firstBraceIndex: -1,
+      endIndex: -1,
+      isTruncated: false,
+      truncatedInString: false,
+      truncatedPosition: targetText.length,
+      braceDepth: 0,
+      bracketDepth: 0,
+    };
+  }
+
+  let insideString = false;
+  let braceDepth = 0;
+  let bracketDepth = 0;
+  let endIndex = -1;
+
+  for (let i = firstBraceIndex; i < targetText.length; i++) {
+    const char = targetText[i];
+
+    if (char === '"') {
+      let backslashCount = 0;
+      for (let j = i - 1; j >= 0 && targetText[j] === "\\"; j--) {
+        backslashCount++;
+      }
+      if (backslashCount % 2 === 0) {
+        insideString = !insideString;
+      }
+      continue;
+    }
+
+    if (!insideString) {
+      if (char === "{") {
+        braceDepth++;
+      } else if (char === "}") {
+        braceDepth--;
+        if (braceDepth === 0) {
+          endIndex = i;
+          break;
+        }
+      } else if (char === "[") {
+        bracketDepth++;
+      } else if (char === "]") {
+        bracketDepth--;
+      }
+    }
+  }
+
+  const isTruncated = endIndex === -1 && (insideString || braceDepth > 0 || bracketDepth > 0);
+
+  return {
+    firstBraceIndex,
+    endIndex,
+    isTruncated,
+    truncatedInString: insideString,
+    truncatedPosition: targetText.length,
+    braceDepth,
+    bracketDepth,
+  };
+}
+
 export function extractJsonString(rawOutput: string): {
   extractedText: string;
   isTruncated: boolean;
@@ -240,53 +319,22 @@ export function extractJsonString(rawOutput: string): {
     }
   }
 
-  // 2. Scan for root JSON object starting at first '{'
-  const firstBraceIndex = targetText.indexOf("{");
-  if (firstBraceIndex === -1) {
+  // 2. Scan for root JSON object starting at first '{' using string-aware scanner
+  const scan = scanJsonStructure(targetText);
+  if (scan.firstBraceIndex === -1) {
     return { extractedText: targetText, isTruncated: fenceTruncated, fenceFound };
   }
 
-  let insideString = false;
-  let braceDepth = 0;
-  let endIndex = -1;
-
-  for (let i = firstBraceIndex; i < targetText.length; i++) {
-    const char = targetText[i];
-
-    if (char === '"') {
-      let backslashCount = 0;
-      for (let j = i - 1; j >= 0 && targetText[j] === "\\"; j--) {
-        backslashCount++;
-      }
-      if (backslashCount % 2 === 0) {
-        insideString = !insideString;
-      }
-      continue;
-    }
-
-    if (!insideString) {
-      if (char === "{") {
-        braceDepth++;
-      } else if (char === "}") {
-        braceDepth--;
-        if (braceDepth === 0) {
-          endIndex = i;
-          break;
-        }
-      }
-    }
-  }
-
-  if (endIndex !== -1) {
+  if (scan.endIndex !== -1) {
     return {
-      extractedText: targetText.slice(firstBraceIndex, endIndex + 1),
+      extractedText: targetText.slice(scan.firstBraceIndex, scan.endIndex + 1),
       isTruncated: false,
       fenceFound,
     };
   }
 
   return {
-    extractedText: targetText.slice(firstBraceIndex),
+    extractedText: targetText.slice(scan.firstBraceIndex),
     isTruncated: true,
     fenceFound,
   };
@@ -346,7 +394,18 @@ export function repairTruncatedJsonString(incompleteJson: string): string {
 
   let repaired = incompleteJson;
   if (insideString) {
+    // If ending with an odd number of trailing backslashes, escape the backslash first
+    let trailingBackslashes = 0;
+    for (let j = repaired.length - 1; j >= 0 && repaired[j] === "\\"; j--) {
+      trailingBackslashes++;
+    }
+    if (trailingBackslashes % 2 !== 0) {
+      repaired += "\\";
+    }
     repaired += '"';
+  } else {
+    // Strip trailing commas, colons, and whitespace outside strings before closing containers
+    repaired = repaired.replace(/[,:\s]+$/, "");
   }
 
   while (stack.length > 0) {
@@ -387,6 +446,9 @@ export function safeParseJson<T = unknown>(rawOutput: string): ExtractedJsonResu
     };
   } catch (initialErr) {
     const isTruncated = structurallyTruncated || isTruncationError(initialErr);
+    const errMessage = initialErr instanceof Error ? initialErr.message : String(initialErr);
+    const posMatch = errMessage.match(/position\s+(\d+)/i);
+    const parsePos = posMatch ? parseInt(posMatch[1], 10) : undefined;
 
     if (!isTruncated) {
       try {
@@ -411,16 +473,85 @@ export function safeParseJson<T = unknown>(rawOutput: string): ExtractedJsonResu
         data: parsed as T,
         rawJson: repaired,
         isTruncated: true,
-        error: initialErr instanceof Error ? initialErr.message : String(initialErr),
+        error: errMessage,
+        truncatedPosition: parsePos ?? sanitized.length,
       };
     } catch {
       return {
         success: false,
         isTruncated,
-        error: initialErr instanceof Error ? initialErr.message : String(initialErr),
+        error: errMessage,
+        truncatedPosition: parsePos ?? sanitized.length,
       };
     }
   }
+}
+
+/**
+ * Extracts any completely formed files from a truncated JSON output.
+ * Preserves already generated files while safely ignoring the cut-off file at the end.
+ */
+/**
+ * Fallback extraction: extracts complete files delivered via Markdown code fences with file headers.
+ * (e.g. ```tsx\n// File: App.tsx\n...code...```)
+ */
+export function extractFilesFromMarkdownFences(rawText: string): GeneratedFile[] {
+  const files: GeneratedFile[] = [];
+  if (!rawText || typeof rawText !== "string") return files;
+
+  const fenceRegex = /```([a-zA-Z0-9_-]*)\s*([^\n]*)\n([\s\S]*?)```/g;
+  let match: RegExpExecArray | null;
+
+  while ((match = fenceRegex.exec(rawText)) !== null) {
+    const tag = (match[1] || "").toLowerCase().trim();
+    const meta = (match[2] || "").trim();
+    let body = match[3];
+
+    // Skip JSON blocks containing "files" to avoid duplicate parsing
+    if (tag === "json" && body.includes('"files"')) {
+      continue;
+    }
+
+    let detectedPath: string | null = null;
+    const metaPathMatch =
+      meta.match(/(?:file|filepath|path)\s*[:=]\s*["']?([^"'\s]+)["']?/i) ||
+      meta.match(/^["']?([a-zA-Z0-9_./-]+\.[a-zA-Z0-9]+)["']?$/);
+    if (metaPathMatch) {
+      detectedPath = metaPathMatch[1].trim();
+    }
+
+    if (!detectedPath) {
+      const lines = body.split("\n", 3);
+      for (let i = 0; i < lines.length; i++) {
+        const line = lines[i].trim();
+        const commentPathMatch = line.match(
+          /^(?:\/\/\s*|\/\*\s*|#\s*)(?:file|filepath|path)\s*[:=]\s*["']?([a-zA-Z0-9_./-]+\.[a-zA-Z0-9]+)["']?(?:\s*\*\/)?/i
+        );
+        if (commentPathMatch) {
+          detectedPath = commentPathMatch[1].trim();
+          const allLines = body.split("\n");
+          allLines.splice(i, 1);
+          body = allLines.join("\n");
+          break;
+        }
+      }
+    }
+
+    if (detectedPath && body.trim()) {
+      try {
+        const normalized = normalizeWorkspacePath(detectedPath);
+        if (normalized.endsWith(".ts") || normalized.endsWith(".tsx")) {
+          const syntaxError = findSyntaxError(normalized, body);
+          if (syntaxError) continue;
+        }
+        files.push({ path: normalized, code: body });
+      } catch {
+        // Ignore invalid paths
+      }
+    }
+  }
+
+  return files;
 }
 
 /**
@@ -431,89 +562,100 @@ export function extractCompleteFilesFromTruncatedJson(rawText: string): Generate
   const files: GeneratedFile[] = [];
   if (!rawText || typeof rawText !== "string") return files;
 
-  const filesKeyRegex = /"files"\s*:\s*\[/i;
+  // 1. Scan for "files" or "changedFiles" array in JSON
+  const filesKeyRegex = /"(?:files|changedFiles)"\s*:\s*\[/i;
   const match = rawText.match(filesKeyRegex);
-  if (!match || match.index === undefined) return files;
 
-  const arrayStartIndex = match.index + match[0].length;
-  let cursor = arrayStartIndex;
+  if (match && match.index !== undefined) {
+    const arrayStartIndex = match.index + match[0].length;
+    let cursor = arrayStartIndex;
 
-  while (cursor < rawText.length) {
-    const nextBrace = rawText.indexOf("{", cursor);
-    if (nextBrace === -1) break;
+    while (cursor < rawText.length) {
+      const nextBrace = rawText.indexOf("{", cursor);
+      if (nextBrace === -1) break;
 
-    let insideString = false;
-    let braceDepth = 0;
-    let objectEnd = -1;
+      let insideString = false;
+      let braceDepth = 0;
+      let objectEnd = -1;
 
-    for (let i = nextBrace; i < rawText.length; i++) {
-      const char = rawText[i];
+      for (let i = nextBrace; i < rawText.length; i++) {
+        const char = rawText[i];
 
-      if (char === '"') {
-        let backslashCount = 0;
-        for (let j = i - 1; j >= 0 && rawText[j] === "\\"; j--) {
-          backslashCount++;
-        }
-        if (backslashCount % 2 === 0) {
-          insideString = !insideString;
-        }
-        continue;
-      }
-
-      if (!insideString) {
-        if (char === "{") {
-          braceDepth++;
-        } else if (char === "}") {
-          braceDepth--;
-          if (braceDepth === 0) {
-            objectEnd = i;
-            break;
+        if (char === '"') {
+          let backslashCount = 0;
+          for (let j = i - 1; j >= 0 && rawText[j] === "\\"; j--) {
+            backslashCount++;
           }
+          if (backslashCount % 2 === 0) {
+            insideString = !insideString;
+          }
+          continue;
         }
-      }
-    }
 
-    if (objectEnd === -1) {
-      break;
-    }
-
-    const fileJsonSnippet = rawText.slice(nextBrace, objectEnd + 1);
-    const sanitizedSnippet = sanitizeJsonString(fileJsonSnippet);
-
-    try {
-      const parsedFile = JSON.parse(sanitizedSnippet);
-      if (
-        parsedFile &&
-        typeof parsedFile === "object" &&
-        typeof parsedFile.path === "string" &&
-        typeof parsedFile.code === "string"
-      ) {
-        const cleanPath = parsedFile.path.trim();
-        const code = parsedFile.code;
-        if (cleanPath && code) {
-          try {
-            const normalized = normalizeWorkspacePath(cleanPath);
-
-            // Validate syntax before marking file as completed
-            if (normalized.endsWith(".ts") || normalized.endsWith(".tsx")) {
-              const syntaxError = findSyntaxError(normalized, code);
-              if (syntaxError) {
-                cursor = objectEnd + 1;
-                continue;
-              }
+        if (!insideString) {
+          if (char === "{") {
+            braceDepth++;
+          } else if (char === "}") {
+            braceDepth--;
+            if (braceDepth === 0) {
+              objectEnd = i;
+              break;
             }
-
-            files.push({ path: normalized, code });
-          } catch {
-            // Ignore invalid paths
           }
         }
       }
-    } catch {
-      // Snippet could not be parsed as valid file
-    }
 
-    cursor = objectEnd + 1;
+      if (objectEnd === -1) {
+        // The file object was cut off in mid-stream (truncated)
+        break;
+      }
+
+      const fileJsonSnippet = rawText.slice(nextBrace, objectEnd + 1);
+      const sanitizedSnippet = sanitizeJsonString(fileJsonSnippet);
+
+      try {
+        const parsedFile = JSON.parse(sanitizedSnippet);
+        if (
+          parsedFile &&
+          typeof parsedFile === "object" &&
+          typeof parsedFile.path === "string" &&
+          typeof parsedFile.code === "string"
+        ) {
+          const cleanPath = parsedFile.path.trim();
+          const code = parsedFile.code;
+          if (cleanPath && code) {
+            try {
+              const normalized = normalizeWorkspacePath(cleanPath);
+
+              // Validate syntax before marking file as completed
+              if (normalized.endsWith(".ts") || normalized.endsWith(".tsx")) {
+                const syntaxError = findSyntaxError(normalized, code);
+                if (syntaxError) {
+                  cursor = objectEnd + 1;
+                  continue;
+                }
+              }
+
+              files.push({ path: normalized, code });
+            } catch {
+              // Ignore invalid paths
+            }
+          }
+        }
+      } catch {
+        // Snippet could not be parsed as valid file
+      }
+
+      cursor = objectEnd + 1;
+    }
+  }
+
+  // 2. Fallback to Markdown fences if no complete files recovered from JSON array
+  if (files.length === 0) {
+    const fencedFiles = extractFilesFromMarkdownFences(rawText);
+    if (fencedFiles.length > 0) {
+      return fencedFiles;
+    }
   }
 
   return files;
@@ -1018,7 +1160,8 @@ export interface PipelineExecutionOptions {
   onProgress?: (
     stageMessage: string,
     progressPercent: number,
-    completedFiles: GeneratedFile[]
+    completedFiles: GeneratedFile[],
+    stageStatus?: GenerationJobStatus
   ) => void;
 }
 
@@ -1054,6 +1197,22 @@ export async function executeGenerationPipeline(
   } = options;
 
   const startPipelineTime = Date.now();
+  const effectiveTimeoutMs = timeoutMs || DEFAULT_PROVIDER_TIMEOUT_MS;
+  const pipelineDeadline = startPipelineTime + effectiveTimeoutMs;
+
+  function checkPipelineDeadline(turnDesc: string): void {
+    if (Date.now() >= pipelineDeadline) {
+      const deadlineErr = new Error(
+        `Application generation pipeline exceeded maximum allowed duration (${Math.round(
+          effectiveTimeoutMs / 60000
+        )} minutes) during ${turnDesc}.`
+      );
+      (deadlineErr as unknown as { status: number; statusCode: number }).status = 504;
+      (deadlineErr as unknown as { status: number; statusCode: number }).statusCode = 504;
+      throw deadlineErr;
+    }
+  }
+
   let initialRequestDurationMs = 0;
   let continuationDurationMs = 0;
   let jsonParsingDurationMs = 0;
@@ -1118,6 +1277,13 @@ Rules:
       accumulatedFiles
     );
 
+    checkPipelineDeadline(`turn ${attempt}`);
+    const remainingMs = pipelineDeadline - Date.now();
+    if (remainingMs <= 0) {
+      checkPipelineDeadline(`turn ${attempt}`);
+    }
+    const callTimeoutMs = Math.min(effectiveTimeoutMs, remainingMs);
+
     const callStartTime = Date.now();
     modelCallsCount++;
 
@@ -1135,7 +1301,7 @@ Rules:
           },
           requestId,
           disableFallback,
-          timeoutMs,
+          timeoutMs: callTimeoutMs,
         },
         provider
       );
@@ -1182,6 +1348,20 @@ Rules:
     jsonParsingDurationMs += Date.now() - parseStartTime;
 
     const isTruncated = isProviderTruncated || parseResult.isTruncated;
+
+    logGenerationStageDiagnostic({
+      requestId,
+      provider: lastUsedProvider,
+      model: lastUsedModel,
+      stage: `pipeline_turn_${attempt}`,
+      attempt,
+      responseLength: outputText.length,
+      finishReason: response.finishReason || undefined,
+      isTruncated,
+      jsonParseError: parseResult.error,
+      recoveredFilesCount: accumulatedFiles.length,
+      jobStatus: "generating",
+    });
 
     // Fast path: if JSON parsed successfully without structural truncation
     if (!isTruncated && parseResult.success && parseResult.data) {
@@ -1427,9 +1607,22 @@ Return ONLY valid JSON:
     }
   }
 
-  throw new Error(
-    `${lastUsedProvider} failed to generate a complete application.`
+  logGenerationStageDiagnostic({
+    requestId,
+    provider: lastUsedProvider,
+    model: lastUsedModel,
+    stage: "pipeline_exhausted",
+    attempt,
+    recoveredFilesCount: accumulatedFiles.length,
+    jobStatus: "failed",
+  });
+
+  const failureErr = new Error(
+    `${lastUsedProvider} failed to generate a complete application after ${attempt} attempts.`
   );
+  (failureErr as unknown as { status: number; statusCode: number }).status = 502;
+  (failureErr as unknown as { status: number; statusCode: number }).statusCode = 502;
+  throw failureErr;
 }
 
 export interface PlannedFile {
@@ -1441,6 +1634,136 @@ export interface ApplicationPlan {
   plan: string;
   files: PlannedFile[];
   dependencies: Record<string, string>;
+}
+
+export interface StageDiagnosticLog {
+  requestId: string;
+  jobId?: string;
+  provider: string;
+  model: string;
+  stage: string;
+  filePath?: string;
+  attempt?: number;
+  responseLength?: number;
+  finishReason?: string;
+  isTruncated?: boolean;
+  jsonParseError?: string;
+  jsonParsePosition?: number;
+  recoveredFilesCount?: number;
+  incompleteFiles?: string[];
+  jobStatus?: string;
+}
+
+export function logGenerationStageDiagnostic(info: StageDiagnosticLog): void {
+  const safeLog: StageDiagnosticLog = {
+    ...info,
+    jsonParseError: info.jsonParseError ? sanitizeErrorMessage(info.jsonParseError) : undefined,
+  };
+  console.log(`[GenDiag] ${JSON.stringify(safeLog)}`);
+}
+
+/**
+ * Extracts a compact, structured representation of user requirements from a prompt.
+ * Preserves essential functional requirements, user flows, and state across the ENTIRE prompt
+ * (including requirements located near the end of long prompts) while removing verbose
+ * system instructions, meta-boilerplate, and redundant styling prose.
+ */
+export function extractCompactRequirements(userPrompt: string): string {
+  if (!userPrompt || typeof userPrompt !== "string") {
+    return "Build a modular React TypeScript application.";
+  }
+
+  const trimmed = userPrompt.trim();
+  if (trimmed.length <= 600) {
+    return trimmed;
+  }
+
+  const lines = trimmed.split(/\r?\n/);
+  const primaryGoalLines: string[] = [];
+  const requirementItems: string[] = [];
+  const seenItems = new Set<string>();
+
+  const isBoilerplate = (line: string): boolean => {
+    return /(?:return only valid json|valid json schema|typescript error|do not include markdown|expert (?:software|react) (?:engineer|developer)|clean code best practices|do not output explanatory text)/i.test(
+      line
+    );
+  };
+
+  const isRequirementCue = (text: string): boolean => {
+    return /(?:must|should|shall|need|needs to|require|required|feature|support|allow|enable|user can|ensure|provide|include|implement|add|track|manage|calculate|export|import|toggle|button|modal|filter|search|sort|view|chart|table|form|goal|budget|persist|store|theme|dark mode|state|action)/i.test(
+      text
+    );
+  };
+
+  let inRequirementsSection = false;
+
+  for (let i = 0; i < lines.length; i++) {
+    const rawLine = lines[i].trim();
+    if (!rawLine) continue;
+
+    if (isBoilerplate(rawLine)) continue;
+
+    // Check for section headers
+    if (/^(?:#+\s*|\*\*)?(?:features|requirements|specifications|functionality|capabilities|user stories|core features|data management|settings|storage)/i.test(rawLine)) {
+      inRequirementsSection = true;
+      continue;
+    }
+
+    // Capture opening 1-2 lines as primary goal
+    if (primaryGoalLines.length < 2 && !inRequirementsSection && !/^[-*•\d+.]/.test(rawLine)) {
+      primaryGoalLines.push(rawLine);
+      continue;
+    }
+
+    // Check for bullet points or numbered list items
+    const listMatch = rawLine.match(/^(?:[-*•]|\d+[.)]|\[[ xX]\])\s*(.+)$/);
+    if (listMatch) {
+      const itemText = listMatch[1].trim();
+      const normKey = itemText.toLowerCase().replace(/[^a-z0-9]/g, "");
+      if (itemText && !isBoilerplate(itemText) && !seenItems.has(normKey)) {
+        seenItems.add(normKey);
+        requirementItems.push(itemText);
+      }
+      continue;
+    }
+
+    // If inside a requirements section or line has strong requirement cues
+    if ((inRequirementsSection || isRequirementCue(rawLine)) && rawLine.length > 15) {
+      const normKey = rawLine.toLowerCase().replace(/[^a-z0-9]/g, "");
+      if (!seenItems.has(normKey)) {
+        seenItems.add(normKey);
+        requirementItems.push(rawLine);
+      }
+    }
+  }
+
+  // If no list items or section items found, extract requirement sentences across the prompt
+  if (requirementItems.length === 0) {
+    const sentences = trimmed.split(/(?<=[.!?])\s+/);
+    for (const sent of sentences) {
+      const cleanSent = sent.trim();
+      if (cleanSent.length > 20 && isRequirementCue(cleanSent) && !isBoilerplate(cleanSent)) {
+        const normKey = cleanSent.toLowerCase().replace(/[^a-z0-9]/g, "");
+        if (!seenItems.has(normKey)) {
+          seenItems.add(normKey);
+          requirementItems.push(cleanSent);
+        }
+      }
+    }
+  }
+
+  const goalText = primaryGoalLines.join(" ").trim() || trimmed.slice(0, 300);
+
+  if (requirementItems.length === 0) {
+    return trimmed.length > 1500 ? trimmed.slice(0, 1500) + "..." : trimmed;
+  }
+
+  const formattedItems = requirementItems.map((item) => `- ${item}`).join("\n");
+  return `Primary Application Goal:
+${goalText}
+
+Essential Features & Requirements:
+${formattedItems}`;
 }
 
 export interface StagedPipelineOptions {
@@ -1455,7 +1778,8 @@ export interface StagedPipelineOptions {
   onProgress?: (
     stageMessage: string,
     progressPercent: number,
-    completedFiles: GeneratedFile[]
+    completedFiles: GeneratedFile[],
+    stageStatus?: GenerationJobStatus
   ) => void;
   maxComponentRetries?: number;
 }
@@ -1500,14 +1824,23 @@ export async function executeStagedGenerationPipeline(
   let fallbackUsed = false;
   let fallbackNotice: string | undefined;
 
-  async function invokeModel(promptText: string): Promise<string> {
-    const callStartTime = Date.now();
-    const remainingMs = pipelineDeadline - Date.now();
-    if (remainingMs <= 0) {
-      const deadlineErr = new Error("Application generation pipeline exceeded maximum allowed duration (10 minutes).");
+  function checkPipelineDeadline(stageName: string): void {
+    if (Date.now() >= pipelineDeadline) {
+      const deadlineErr = new Error(
+        `Application generation pipeline exceeded maximum allowed duration (${Math.round(timeoutMs / 60000)} minutes) during stage '${stageName}'.`
+      );
       (deadlineErr as unknown as { status: number; statusCode: number }).status = 504;
       (deadlineErr as unknown as { status: number; statusCode: number }).statusCode = 504;
       throw deadlineErr;
+    }
+  }
+
+  async function invokeModel(promptText: string, stageName: string): Promise<string> {
+    checkPipelineDeadline(stageName);
+    const callStartTime = Date.now();
+    const remainingMs = pipelineDeadline - Date.now();
+    if (remainingMs <= 0) {
+      checkPipelineDeadline(stageName);
     }
 
     modelCallsCount++;
@@ -1552,7 +1885,7 @@ export async function executeStagedGenerationPipeline(
 
     const output = result.response.outputText || "";
     if (!output || !output.trim()) {
-      const emptyErr = new Error(`${lastUsedProvider} returned an empty completion.`);
+      const emptyErr = new Error(`${lastUsedProvider} returned an empty completion during stage '${stageName}'.`);
       (emptyErr as unknown as { status: number; statusCode: number }).status = 502;
       (emptyErr as unknown as { status: number; statusCode: number }).statusCode = 502;
       throw emptyErr;
@@ -1561,7 +1894,7 @@ export async function executeStagedGenerationPipeline(
   }
 
   // --- STAGE 1: PLAN APPLICATION ARCHITECTURE ---
-  onProgress?.("Planning application architecture...", 10, accumulatedFiles);
+  onProgress?.("Planning application architecture...", 10, accumulatedFiles, "planning");
 
   const planPrompt = `Plan a React TypeScript application based on this request:
 "${userPrompt}"
@@ -1589,10 +1922,24 @@ Return ONLY valid JSON matching this schema:
   let plannedFiles: PlannedFile[] = [];
 
   try {
-    const planOutput = await invokeModel(planPrompt);
+    const planOutput = await invokeModel(planPrompt, "planning");
     const parseStart = Date.now();
     const parsedPlan = safeParseJson<ApplicationPlan>(planOutput);
     jsonParsingDurationMs += Date.now() - parseStart;
+
+    logGenerationStageDiagnostic({
+      requestId,
+      provider: lastUsedProvider,
+      model: lastUsedModel,
+      stage: "planning",
+      attempt: 1,
+      responseLength: planOutput.length,
+      isTruncated: parsedPlan.isTruncated,
+      jsonParseError: parsedPlan.error,
+      jsonParsePosition: parsedPlan.truncatedPosition,
+      recoveredFilesCount: 0,
+      jobStatus: "planning",
+    });
 
     if (parsedPlan.success && parsedPlan.data?.files && Array.isArray(parsedPlan.data.files)) {
       for (const item of parsedPlan.data.files) {
@@ -1661,18 +2008,14 @@ Return ONLY valid JSON matching this schema:
       !sharedFiles.some((sf) => sf.path === f.path)
   );
 
-  if (Date.now() > pipelineDeadline) {
-    const deadlineErr = new Error("Application generation pipeline exceeded maximum allowed duration (10 minutes).");
-    (deadlineErr as unknown as { status: number; statusCode: number }).status = 504;
-    (deadlineErr as unknown as { status: number; statusCode: number }).statusCode = 504;
-    throw deadlineErr;
-  }
+  checkPipelineDeadline("planning");
 
   // --- STAGE 2: GENERATE SHARED TYPES & UTILITIES ---
   for (let i = 0; i < sharedFiles.length; i++) {
+    checkPipelineDeadline("generating_shared");
     const file = sharedFiles[i];
     const progress = 20 + Math.round(((i + 1) / (sharedFiles.length + 1)) * 15);
-    onProgress?.(`Generating shared file: ${file.path}...`, progress, accumulatedFiles);
+    onProgress?.(`Generating shared file: ${file.path}...`, progress, accumulatedFiles, "generating_shared");
 
     const sharedPrompt = `Generate the following shared file for the React TypeScript application "${userPrompt}":
 Path: "${file.path}"
@@ -1690,10 +2033,25 @@ Return ONLY valid JSON:
 }`;
 
     try {
-      const output = await invokeModel(sharedPrompt);
+      const output = await invokeModel(sharedPrompt, "generating_shared");
       const parseStart = Date.now();
       const parsed = safeParseJson<GenerationOutput>(output);
       jsonParsingDurationMs += Date.now() - parseStart;
+
+      logGenerationStageDiagnostic({
+        requestId,
+        provider: lastUsedProvider,
+        model: lastUsedModel,
+        stage: "generating_shared",
+        filePath: file.path,
+        attempt: 1,
+        responseLength: output.length,
+        isTruncated: parsed.isTruncated,
+        jsonParseError: parsed.error,
+        jsonParsePosition: parsed.truncatedPosition,
+        recoveredFilesCount: accumulatedFiles.length,
+        jobStatus: "generating_shared",
+      });
 
       if (parsed.success && parsed.data?.files) {
         const valStart = Date.now();
@@ -1706,18 +2064,19 @@ Return ONLY valid JSON:
             Object.assign(accumulatedDeps, validated.dependencies);
           }
         }
+      } else {
+        const recovered = extractCompleteFilesFromTruncatedJson(output);
+        const fileRecovered = recovered.find((f) => f.path === file.path);
+        if (fileRecovered) {
+          accumulatedFiles = mergeGeneratedFiles(accumulatedFiles, [fileRecovered]);
+        }
       }
     } catch (sharedErr) {
       console.warn(`[Req ${requestId}] Failed to generate shared file ${file.path}:`, sharedErr);
     }
   }
 
-  if (Date.now() > pipelineDeadline) {
-    const deadlineErr = new Error("Application generation pipeline exceeded maximum allowed duration (10 minutes).");
-    (deadlineErr as unknown as { status: number; statusCode: number }).status = 504;
-    (deadlineErr as unknown as { status: number; statusCode: number }).statusCode = 504;
-    throw deadlineErr;
-  }
+  checkPipelineDeadline("generating_shared");
 
   // --- STAGE 3: GENERATE INDIVIDUAL COMPONENTS ---
   const sharedContext = accumulatedFiles
@@ -1726,9 +2085,10 @@ Return ONLY valid JSON:
     .join("\n\n");
 
   for (let i = 0; i < componentFiles.length; i++) {
+    checkPipelineDeadline("generating_components");
     const comp = componentFiles[i];
     const progress = 35 + Math.round(((i + 1) / (componentFiles.length + 1)) * 40);
-    onProgress?.(`Generating component: ${comp.path}...`, progress, accumulatedFiles);
+    onProgress?.(`Generating component: ${comp.path}...`, progress, accumulatedFiles, "generating_components");
 
     let compPrompt = `Generate the component "${comp.path}" for the application "${userPrompt}".
 Purpose: "${comp.purpose}"
@@ -1754,11 +2114,27 @@ Rules:
     let retries = 0;
 
     while (!compSuccess && retries <= maxComponentRetries) {
+      checkPipelineDeadline("generating_components");
       try {
-        const output = await invokeModel(compPrompt);
+        const output = await invokeModel(compPrompt, "generating_components");
         const parseStart = Date.now();
         const parsed = safeParseJson<GenerationOutput>(output);
         jsonParsingDurationMs += Date.now() - parseStart;
+
+        logGenerationStageDiagnostic({
+          requestId,
+          provider: lastUsedProvider,
+          model: lastUsedModel,
+          stage: "generating_components",
+          filePath: comp.path,
+          attempt: retries + 1,
+          responseLength: output.length,
+          isTruncated: parsed.isTruncated,
+          jsonParseError: parsed.error,
+          jsonParsePosition: parsed.truncatedPosition,
+          recoveredFilesCount: accumulatedFiles.length,
+          jobStatus: "generating_components",
+        });
 
         if (parsed.success && parsed.data?.files) {
           const valStart = Date.now();
@@ -1809,17 +2185,13 @@ Return ONLY valid JSON:
     }
   }
 
-  if (Date.now() > pipelineDeadline) {
-    const deadlineErr = new Error("Application generation pipeline exceeded maximum allowed duration (10 minutes).");
-    (deadlineErr as unknown as { status: number; statusCode: number }).status = 504;
-    (deadlineErr as unknown as { status: number; statusCode: number }).statusCode = 504;
-    throw deadlineErr;
-  }
+  checkPipelineDeadline("generating_components");
 
   // --- STAGE 4: GENERATE MAIN APPLICATION ENTRY POINT (App.tsx) ---
-  onProgress?.("Generating main application entry point (App.tsx)...", 80, accumulatedFiles);
+  onProgress?.("Generating main application entry point (App.tsx)...", 80, accumulatedFiles, "generating_entry");
 
   const availableFilesSummary = accumulatedFiles
+    .filter((f) => f.path !== "App.tsx")
     .map((f) => `- ${f.path}`)
     .join("\n");
 
@@ -1829,15 +2201,22 @@ Return ONLY valid JSON:
       ? `\nType definitions:\n${typesFile.code}\n`
       : "";
 
-  const baseAppPrompt = `Generate the main application file "App.tsx" for the application "${userPrompt}".
+  const compactReqs = extractCompactRequirements(userPrompt);
 
-Available components and files in the project:
+  const baseAppPrompt = `Generate the main application file "App.tsx" that coordinates the application:
+
+${compactReqs}
+
+Existing components already created in the project:
 ${availableFilesSummary || "- (Single file application)"}
 ${typesSummary}
 Rules:
 - The main file must be App.tsx with default export: export default function App().
 - Import and connect the available components cleanly.
+- Do NOT re-implement or duplicate the logic of existing components. App.tsx is the orchestrator.
 - Manage root application state and user interactions cleanly.
+- Connect all required features, actions, and user controls in App.tsx.
+- Keep App.tsx concise (under 120-150 lines) so it stays well within output token limits.
 - Use React and TypeScript.
 - Return ONLY valid JSON:
 {
@@ -1854,29 +2233,28 @@ Rules:
   let appGenerated = false;
   let appRetries = 0;
   let lastAppError = "";
-  let lastAppStatusCode: number | undefined;
+  let lastAppStatusCode = 502;
+  const maxAppRetries = typeof maxComponentRetries === "number" && maxComponentRetries >= 0 ? maxComponentRetries : 1;
 
-  while (!appGenerated && appRetries <= maxComponentRetries) {
-    if (Date.now() >= pipelineDeadline) {
-      const deadlineErr = new Error("Application generation pipeline exceeded maximum allowed duration (10 minutes).");
-      (deadlineErr as unknown as { status: number; statusCode: number }).status = 504;
-      (deadlineErr as unknown as { status: number; statusCode: number }).statusCode = 504;
-      throw deadlineErr;
-    }
+  while (!appGenerated && appRetries <= maxAppRetries) {
+    checkPipelineDeadline("generating_entry");
 
     if (appRetries > 0) {
-      // Sensible bounded backoff delay before retry
       await new Promise((resolve) => setTimeout(resolve, 300 * appRetries));
 
-      // Compact retry prompt without huge sharedContext to avoid hitting model context/token limits
-      currentAppPrompt = `Generate ONLY the main App.tsx file for "${userPrompt}".
-Available components to import:
-${availableFilesSummary || "- None"}
+      currentAppPrompt = `The previous attempt for App.tsx was truncated or incomplete.
+Generate a clean, compact "App.tsx" orchestrator that connects the application components according to these requirements:
 
+${compactReqs}
+
+Existing components already created in the project (do not duplicate their logic):
+${availableFilesSummary || "- None"}
+${typesSummary}
 Rules:
-- The file path must be "App.tsx" with "export default function App()".
-- Import and connect the available components cleanly.
-- Keep implementation clean, functional, and compact.
+- Default export: export default function App()
+- Import and assemble available components. Do not rewrite their internal logic.
+- Coordinate the required features, root state, and user interactions cleanly.
+- Keep the implementation clean, functional, and compact (under 120-150 lines) to avoid truncation.
 - Return ONLY valid JSON:
 {
   "files": [
@@ -1890,10 +2268,26 @@ Rules:
     }
 
     try {
-      const output = await invokeModel(currentAppPrompt);
+      const output = await invokeModel(currentAppPrompt, "generating_entry");
       const parseStart = Date.now();
       const parsed = safeParseJson<GenerationOutput>(output);
       jsonParsingDurationMs += Date.now() - parseStart;
+
+      logGenerationStageDiagnostic({
+        requestId,
+        provider: lastUsedProvider,
+        model: lastUsedModel,
+        stage: "generating_entry",
+        filePath: "App.tsx",
+        attempt: appRetries + 1,
+        responseLength: output.length,
+        isTruncated: parsed.isTruncated,
+        jsonParseError: parsed.error,
+        jsonParsePosition: parsed.truncatedPosition,
+        recoveredFilesCount: accumulatedFiles.length,
+        incompleteFiles: parsed.isTruncated ? ["App.tsx"] : undefined,
+        jobStatus: "generating_entry",
+      });
 
       if (parsed.success && parsed.data?.files) {
         const valStart = Date.now();
@@ -1908,11 +2302,11 @@ Rules:
           appGenerated = true;
         } else if (validated.error) {
           lastAppError = validated.error;
-          lastAppStatusCode = 400;
+          lastAppStatusCode = 502;
         }
       } else if (!parsed.success && parsed.error) {
         lastAppError = parsed.error;
-        lastAppStatusCode = 400;
+        lastAppStatusCode = 502;
       }
 
       if (!appGenerated) {
@@ -1933,7 +2327,8 @@ Rules:
       }
       lastAppStatusCode =
         (err as { status?: number; statusCode?: number })?.status ||
-        (err as { status?: number; statusCode?: number })?.statusCode;
+        (err as { status?: number; statusCode?: number })?.statusCode ||
+        502;
 
       if (!isRetryableModelError(err)) {
         break;
@@ -1943,35 +2338,34 @@ Rules:
   }
 
   if (!accumulatedFiles.some((f) => f.path === "App.tsx" || f.path.endsWith("/App.tsx"))) {
+    const sanitizedReason = lastAppError
+      ? (isTruncationError(lastAppError)
+          ? "model response was truncated due to output token limits"
+          : lastAppError)
+      : "model failed to produce a valid App.tsx";
     const finalErr = new Error(
-      lastAppError || `${lastUsedProvider} failed to generate a valid App.tsx.`
+      `Meta Muse Spark generation failed at stage 'generating_entry' (App.tsx): ${sanitizedReason}.`
     );
-    if (lastAppStatusCode) {
-      (finalErr as unknown as { status: number; statusCode: number }).status = lastAppStatusCode;
-      (finalErr as unknown as { status: number; statusCode: number }).statusCode = lastAppStatusCode;
-    }
+    (finalErr as unknown as { status: number; statusCode: number }).status = lastAppStatusCode || 502;
+    (finalErr as unknown as { status: number; statusCode: number }).statusCode = lastAppStatusCode || 502;
     throw finalErr;
   }
 
-  if (Date.now() > pipelineDeadline) {
-    const deadlineErr = new Error("Application generation pipeline exceeded maximum allowed duration (10 minutes).");
-    (deadlineErr as unknown as { status: number; statusCode: number }).status = 504;
-    (deadlineErr as unknown as { status: number; statusCode: number }).statusCode = 504;
-    throw deadlineErr;
-  }
+  checkPipelineDeadline("generating_entry");
 
   // --- STAGE 5: VALIDATE & REPAIR MISSING IMPORTS ---
-  onProgress?.("Validating application syntax and relative imports...", 90, accumulatedFiles);
+  onProgress?.("Validating application syntax and relative imports...", 90, accumulatedFiles, "validating");
 
   const missingImports = findMissingLocalImports(accumulatedFiles);
   if (missingImports.length > 0) {
-    // Repair up to 2 missing files individually
     const toRepair = missingImports.slice(0, 2);
     for (const missing of toRepair) {
+      checkPipelineDeadline("recovering");
       onProgress?.(
         `Generating missing component: ${missing.missingPath}...`,
         95,
-        accumulatedFiles
+        accumulatedFiles,
+        "recovering"
       );
 
       const repairPrompt = `Generate the missing component "${missing.missingPath}" required by "${missing.importedBy}".
@@ -1992,8 +2386,23 @@ Return ONLY valid JSON:
 }`;
 
       try {
-        const repairOutput = await invokeModel(repairPrompt);
+        const repairOutput = await invokeModel(repairPrompt, "recovering");
         const parsed = safeParseJson<GenerationOutput>(repairOutput);
+
+        logGenerationStageDiagnostic({
+          requestId,
+          provider: lastUsedProvider,
+          model: lastUsedModel,
+          stage: "recovering",
+          filePath: missing.missingPath,
+          attempt: 1,
+          responseLength: repairOutput.length,
+          isTruncated: parsed.isTruncated,
+          jsonParseError: parsed.error,
+          recoveredFilesCount: accumulatedFiles.length,
+          jobStatus: "recovering",
+        });
+
         if (parsed.success && parsed.data?.files) {
           const validated = validateGenerationOutput(parsed.data);
           if (validated.valid && validated.files) {
@@ -2015,12 +2424,15 @@ Return ONLY valid JSON:
   syntaxValidationDurationMs += Date.now() - finalValStart;
 
   if (finalSyntaxErr) {
-    throw new Error(
+    const synErr = new Error(
       `${lastUsedProvider} generated invalid TypeScript (${finalSyntaxErr}).`
     );
+    (synErr as unknown as { status: number; statusCode: number }).status = 502;
+    (synErr as unknown as { status: number; statusCode: number }).statusCode = 502;
+    throw synErr;
   }
 
-  onProgress?.("Application generation completed successfully.", 100, accumulatedFiles);
+  onProgress?.("Application generation completed successfully.", 100, accumulatedFiles, "completed");
 
   const totalDurationMs = Date.now() - startPipelineTime;
   const timings: PipelineTimingInfo = {
@@ -2033,6 +2445,16 @@ Return ONLY valid JSON:
     recoveredFilesCount: accumulatedFiles.length,
     finalFilesCount: accumulatedFiles.length,
   };
+
+  logGenerationStageDiagnostic({
+    requestId,
+    provider: lastUsedProvider,
+    model: lastUsedModel,
+    stage: "completed",
+    attempt: modelCallsCount,
+    recoveredFilesCount: accumulatedFiles.length,
+    jobStatus: "completed",
+  });
 
   return {
     files: accumulatedFiles,

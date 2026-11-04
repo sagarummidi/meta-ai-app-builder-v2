@@ -4,6 +4,7 @@ import {
   AVAILABLE_PROVIDERS,
   getErrorStatusCode,
   sanitizeErrorMessage,
+  DEFAULT_PROVIDER_TIMEOUT_MS,
 } from "@/lib/modelRouter";
 import {
   enforceRouteRateLimit,
@@ -15,7 +16,7 @@ import {
   executeGenerationPipeline,
   executeStagedGenerationPipeline,
 } from "@/lib/jsonRecovery";
-import { globalJobStore } from "@/lib/generationJobs";
+import { globalJobStore, type GenerationJobStatus } from "@/lib/generationJobs";
 
 export const maxDuration = 600;
 export const dynamic = "force-dynamic";
@@ -55,7 +56,7 @@ export async function GET(request: Request) {
         message: job.error || "Generation job failed.",
         completedFilePaths: job.completedFilePaths,
       },
-      { status: job.statusCode || 500 }
+      { status: job.statusCode || 502 }
     );
   }
 
@@ -187,6 +188,10 @@ export async function POST(request: Request, context?: unknown) {
 
     const activeConcurrencyLimiter = injectedConcurrencyLimiter || defaultConcurrencyLimiter;
     const rawMode = typeof body.mode === "string" ? body.mode.trim().toLowerCase() : "";
+    const requestedTimeoutMs =
+      typeof body.timeoutMs === "number" && Number.isFinite(body.timeoutMs) && body.timeoutMs > 0
+        ? Math.min(body.timeoutMs, DEFAULT_PROVIDER_TIMEOUT_MS)
+        : undefined;
     const isAsyncMode = rawMode === "async" || (rawMode !== "sync" && process.env.NODE_ENV !== "test");
 
     if (isAsyncMode) {
@@ -208,9 +213,10 @@ export async function POST(request: Request, context?: unknown) {
             requestId: reqId,
             disableFallback: true,
             concurrencyLimiter: activeConcurrencyLimiter,
-            onProgress: (stageMessage, progressPercent, completedFiles) => {
+            timeoutMs: requestedTimeoutMs,
+            onProgress: (stageMessage: string, progressPercent: number, completedFiles: { path: string }[], stageStatus?: GenerationJobStatus) => {
               globalJobStore.updateJobProgress(reqId, {
-                status: "generating_components",
+                status: stageStatus || "generating_components",
                 stageMessage,
                 progressPercent,
                 completedFilePaths: completedFiles.map((f) => f.path),

@@ -139,7 +139,7 @@ class GenerationJobStore {
   public failJob(
     id: string,
     error: string,
-    statusCode: number = 500
+    statusCode: number = 502
   ): GenerationJob | undefined {
     const job = this.jobs.get(id);
     if (!job) return undefined;

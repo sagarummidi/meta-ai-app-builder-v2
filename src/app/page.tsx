@@ -936,7 +936,8 @@ export default function Home() {
         let consecutiveNetworkErrors = 0;
 
         while (!jobCompleted && pollAttempts < maxPollAttempts) {
-          await new Promise((resolve) => setTimeout(resolve, 1500));
+          const delayMs = pollAttempts < 5 ? 1000 : pollAttempts < 20 ? 1500 : 2000;
+          await new Promise((resolve) => setTimeout(resolve, delayMs));
           pollAttempts++;
 
           let pollRes: Response;
@@ -958,21 +959,29 @@ export default function Home() {
           const pollText = await pollRes.text();
           if (!pollText.trim()) continue;
 
-          let pollData: Record<string, unknown>;
+          let pollData: Record<string, unknown> | null = null;
           try {
             pollData = JSON.parse(pollText);
           } catch {
+            // Safely handle malformed or non-JSON error response from server
+            if (!pollRes.ok) {
+              const stripped = pollText.replace(/<[^>]+>/g, " ").replace(/\s+/g, " ").trim();
+              const snippet = stripped.length > 200 ? stripped.slice(0, 200) + "..." : stripped;
+              throw new Error(snippet || `Generation failed (HTTP ${pollRes.status} ${pollRes.statusText}).`);
+            }
             continue;
           }
 
-          if (!pollRes.ok || pollData.success === false) {
-            throw new Error(
+          if (!pollData) continue;
+
+          if (!pollRes.ok || pollData.success === false || pollData.status === "failed") {
+            const rawMsg =
               typeof pollData.message === "string"
                 ? pollData.message
                 : typeof pollData.error === "string"
                 ? pollData.error
-                : `Generation failed (HTTP ${pollRes.status}).`
-            );
+                : `Generation failed (HTTP ${pollRes.status}).`;
+            throw new Error(rawMsg);
           }
 
           if (pollData.status === "completed") {
@@ -1168,7 +1177,8 @@ export default function Home() {
         let consecutiveNetworkErrors = 0;
 
         while (!jobCompleted && pollAttempts < maxPollAttempts) {
-          await new Promise((resolve) => setTimeout(resolve, 1500));
+          const delayMs = pollAttempts < 5 ? 1000 : pollAttempts < 20 ? 1500 : 2000;
+          await new Promise((resolve) => setTimeout(resolve, delayMs));
           pollAttempts++;
 
           let pollRes: Response;
@@ -1190,21 +1200,29 @@ export default function Home() {
           const pollText = await pollRes.text();
           if (!pollText.trim()) continue;
 
-          let pollData: Record<string, unknown>;
+          let pollData: Record<string, unknown> | null = null;
           try {
             pollData = JSON.parse(pollText);
           } catch {
+            // Safely handle malformed or non-JSON error response from server
+            if (!pollRes.ok) {
+              const stripped = pollText.replace(/<[^>]+>/g, " ").replace(/\s+/g, " ").trim();
+              const snippet = stripped.length > 200 ? stripped.slice(0, 200) + "..." : stripped;
+              throw new Error(snippet || `Generation failed (HTTP ${pollRes.status} ${pollRes.statusText}).`);
+            }
             continue;
           }
 
-          if (!pollRes.ok || pollData.success === false) {
-            throw new Error(
+          if (!pollData) continue;
+
+          if (!pollRes.ok || pollData.success === false || pollData.status === "failed") {
+            const rawMsg =
               typeof pollData.message === "string"
                 ? pollData.message
                 : typeof pollData.error === "string"
                 ? pollData.error
-                : `Generation failed (HTTP ${pollRes.status}).`
-            );
+                : `Generation failed (HTTP ${pollRes.status}).`;
+            throw new Error(rawMsg);
           }
 
           if (pollData.status === "completed") {
