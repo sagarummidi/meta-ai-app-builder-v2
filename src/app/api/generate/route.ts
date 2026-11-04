@@ -18,7 +18,7 @@ import {
 } from "@/lib/jsonRecovery";
 import { globalJobStore, type GenerationJobStatus } from "@/lib/generationJobs";
 
-export const maxDuration = 300;
+export const maxDuration = 600;
 export const dynamic = "force-dynamic";
 
 const MAX_PROMPT_LENGTH = 15000;
