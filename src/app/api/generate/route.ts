@@ -16,7 +16,11 @@ import {
   executeGenerationPipeline,
   executeStagedGenerationPipeline,
 } from "@/lib/jsonRecovery";
-import { globalJobStore, type GenerationJobStatus } from "@/lib/generationJobs";
+import {
+  globalJobStore,
+  startJobHeartbeat,
+  type GenerationJobStatus,
+} from "@/lib/generationJobs";
 
 export const maxDuration = 600;
 export const dynamic = "force-dynamic";
@@ -34,7 +38,20 @@ export async function GET(request: Request) {
     );
   }
 
-  const job = globalJobStore.getJob(jobId.trim());
+  let job: import("@/lib/generationJobs").GenerationJob | undefined;
+  try {
+    job = await globalJobStore.getJobAsync(jobId.trim());
+  } catch (err) {
+    const rawMessage = err instanceof Error ? err.message : "Database error";
+    return NextResponse.json(
+      {
+        success: false,
+        message: sanitizeErrorMessage(rawMessage),
+      },
+      { status: 503 }
+    );
+  }
+
   if (!job) {
     return NextResponse.json(
       {
@@ -55,6 +72,10 @@ export async function GET(request: Request) {
         error: job.error,
         message: job.error || "Generation job failed.",
         completedFilePaths: job.completedFilePaths,
+        pendingFilePaths: job.pendingFilePaths || [],
+        failedFilePaths: job.failedFilePaths || [],
+        files: job.partialFiles || [],
+        manifest: job.manifest || [],
       },
       { status: job.statusCode || 502 }
     );
@@ -68,9 +89,12 @@ export async function GET(request: Request) {
       stageMessage: job.stageMessage,
       progressPercent: 100,
       completedFilePaths: job.completedFilePaths,
+      pendingFilePaths: [],
+      failedFilePaths: job.failedFilePaths || [],
       prompt: job.prompt,
       generatedCode: job.result.generatedCode,
       files: job.result.files,
+      manifest: job.manifest || [],
       dependencies: job.result.dependencies,
       usedModel: job.result.usedModel,
       usedProvider: job.result.usedProvider,
@@ -87,6 +111,10 @@ export async function GET(request: Request) {
     stageMessage: job.stageMessage,
     progressPercent: job.progressPercent,
     completedFilePaths: job.completedFilePaths,
+    pendingFilePaths: job.pendingFilePaths || [],
+    failedFilePaths: job.failedFilePaths || [],
+    files: job.partialFiles || [],
+    manifest: job.manifest || [],
   });
 }
 
@@ -97,6 +125,8 @@ export async function POST(request: Request, context?: unknown) {
   const injectedRateLimiter = (context as { rateLimiter?: IRateLimiter })?.rateLimiter;
   const injectedConcurrencyLimiter = (context as { concurrencyLimiter?: ConcurrencyLimiter })
     ?.concurrencyLimiter;
+  const injectedModelRouter = (context as { modelRouter?: import("@/lib/modelRouter").ModelRouter })?.modelRouter;
+  const activeModelRouter = injectedModelRouter || modelRouter;
 
   const rateLimitCheck = await enforceRouteRateLimit(request, "generate", {
     limiter: injectedRateLimiter,
@@ -121,16 +151,62 @@ export async function POST(request: Request, context?: unknown) {
     );
   }
 
+  let resumeJobId: string | undefined;
+  let reqId = serverReqId;
+
   try {
+    reqId = typeof body?.requestId === "string" && body.requestId.trim() ? body.requestId.trim() : serverReqId;
+
+    // Check for resumable job continuation
+    resumeJobId = typeof body?.resumeJobId === "string" && body.resumeJobId.trim() ? body.resumeJobId.trim() : undefined;
+    let previousJob: import("@/lib/generationJobs").GenerationJob | undefined;
+    if (resumeJobId) {
+      try {
+        previousJob = await globalJobStore.getJobAsync(resumeJobId);
+      } catch (err) {
+        const rawMessage = err instanceof Error ? err.message : "Database error";
+        return NextResponse.json(
+          {
+            success: false,
+            requestId: reqId,
+            message: sanitizeErrorMessage(rawMessage),
+          },
+          { status: 503 }
+        );
+      }
+
+      if (!previousJob) {
+        return NextResponse.json(
+          {
+            success: false,
+            requestId: reqId,
+            message: `Resume job '${resumeJobId}' not found or has expired.`,
+          },
+          { status: 404 }
+        );
+      }
+
+      const lockAcquired = await globalJobStore.acquireResumeLock(resumeJobId, reqId);
+      if (!lockAcquired) {
+        return NextResponse.json(
+          {
+            success: false,
+            requestId: reqId,
+            message: `Job '${resumeJobId}' is currently being resumed by another worker or request. Please retry shortly.`,
+          },
+          { status: 409 }
+        );
+      }
+    }
+
     const rawPrompt = typeof body?.prompt === "string" ? body.prompt : "";
-    const prompt = rawPrompt.trim();
-    const reqId = typeof body?.requestId === "string" && body.requestId.trim() ? body.requestId.trim() : serverReqId;
+    const prompt = (rawPrompt.trim() || previousJob?.prompt || "").trim();
 
     const rawProvider =
       typeof body?.provider === "string" && body.provider.trim()
         ? body.provider.trim()
-        : process.env.AI_PROVIDER || "meta";
-    console.log(`[Req ${reqId}] POST /api/generate received prompt length: ${prompt.length}, raw provider: ${rawProvider}`);
+        : previousJob?.provider || process.env.AI_PROVIDER || "meta";
+    console.log(`[Req ${reqId}] POST /api/generate received prompt length: ${prompt.length}, raw provider: ${rawProvider}, resume: ${Boolean(resumeJobId)}`);
 
     if (!prompt) {
       console.log(`[Req ${reqId}] Rejected: empty prompt`);
@@ -170,7 +246,7 @@ export async function POST(request: Request, context?: unknown) {
     }
 
     const providerType = providerConfig.provider;
-    const requestedModel = typeof body.model === "string" && body.model.trim() ? body.model.trim() : undefined;
+    const requestedModel = typeof body.model === "string" && body.model.trim() ? body.model.trim() : previousJob?.model;
     const modelToUse = requestedModel || providerConfig.models.find((m) => m.isDefault)?.id || providerConfig.models[0]?.id || "";
 
     const isModelValid = providerConfig.models.some((m) => m.id === modelToUse);
@@ -194,19 +270,51 @@ export async function POST(request: Request, context?: unknown) {
         : undefined;
     const isAsyncMode = rawMode === "async" || (rawMode !== "sync" && process.env.NODE_ENV !== "test");
 
+    const existingFilesFromBody = Array.isArray(body.existingFiles) ? (body.existingFiles as import("@/lib/jsonRecovery").GeneratedFile[]) : [];
+    const initialFiles = previousJob?.partialFiles && previousJob.partialFiles.length > 0
+      ? previousJob.partialFiles
+      : existingFilesFromBody;
+    const initialManifest = previousJob?.manifest || [];
+    const maxManifestFiles = typeof body.maxManifestFiles === "number" && body.maxManifestFiles > 0 ? body.maxManifestFiles : undefined;
+    const hierarchicalPlanning = typeof body.hierarchicalPlanning === "boolean" ? body.hierarchicalPlanning : undefined;
+    const concurrency = typeof body.concurrency === "number" && body.concurrency > 0 ? Math.min(2, body.concurrency) : undefined;
+
     if (isAsyncMode) {
-      const job = globalJobStore.createJob(reqId, prompt, providerType, modelToUse);
+      let job: import("@/lib/generationJobs").GenerationJob;
+      try {
+        job = await globalJobStore.createJobAsync(reqId, prompt, providerType, modelToUse, initialFiles, initialManifest);
+        await globalJobStore.acquireResumeLock(reqId, reqId);
+      } catch (dbErr) {
+        if (resumeJobId) {
+          await globalJobStore.releaseResumeLock(resumeJobId, reqId).catch(() => {});
+        }
+        await globalJobStore.releaseResumeLock(reqId, reqId).catch(() => {});
+        const rawMessage = dbErr instanceof Error ? dbErr.message : "Database error";
+        return NextResponse.json(
+          {
+            success: false,
+            requestId: reqId,
+            message: sanitizeErrorMessage(rawMessage),
+          },
+          { status: 503 }
+        );
+      }
 
       (async () => {
+        const activeJobIds = resumeJobId ? [reqId, resumeJobId] : [reqId];
+        const heartbeat = startJobHeartbeat(activeJobIds, reqId);
+
         try {
-          globalJobStore.updateJobProgress(reqId, {
-            status: "planning",
-            stageMessage: "Planning application architecture...",
-            progressPercent: 10,
+          await globalJobStore.updateJobProgressAsync(reqId, {
+            status: initialFiles.length > 0 ? "generating_components" : "planning",
+            stageMessage: initialFiles.length > 0
+              ? `Resuming generation with ${initialFiles.length} existing files...`
+              : "Planning application architecture...",
+            progressPercent: initialFiles.length > 0 ? 30 : 10,
           });
 
           const pipelineResult = await executeStagedGenerationPipeline({
-            modelRouter,
+            modelRouter: activeModelRouter,
             provider: providerType,
             model: modelToUse,
             userPrompt: prompt,
@@ -214,12 +322,31 @@ export async function POST(request: Request, context?: unknown) {
             disableFallback: true,
             concurrencyLimiter: activeConcurrencyLimiter,
             timeoutMs: requestedTimeoutMs,
-            onProgress: (stageMessage: string, progressPercent: number, completedFiles: { path: string }[], stageStatus?: GenerationJobStatus) => {
-              globalJobStore.updateJobProgress(reqId, {
+            initialFiles,
+            initialManifest,
+            maxManifestFiles,
+            hierarchicalPlanning,
+            concurrency,
+            onProgress: (
+              stageMessage: string,
+              progressPercent: number,
+              completedFiles: import("@/lib/jsonRecovery").GeneratedFile[],
+              stageStatus?: GenerationJobStatus,
+              pendingFiles?: import("@/lib/jsonRecovery").PlannedFile[] | string[],
+              failedFiles?: { path: string; error?: string }[] | string[],
+              manifest?: import("@/lib/jsonRecovery").PlannedFile[]
+            ) => {
+              void globalJobStore.updateJobProgressAsync(reqId, {
                 status: stageStatus || "generating_components",
                 stageMessage,
                 progressPercent,
                 completedFilePaths: completedFiles.map((f) => f.path),
+                partialFiles: completedFiles,
+                pendingFilePaths: pendingFiles?.map((f) => (typeof f === "string" ? f : f.path)),
+                failedFilePaths: failedFiles?.map((f) => (typeof f === "string" ? f : f.path)),
+                manifest,
+              }).catch((err) => {
+                console.warn(`[Req ${reqId}] Failed to persist progress update:`, err);
               });
             },
           });
@@ -232,7 +359,7 @@ export async function POST(request: Request, context?: unknown) {
             validFiles.find((file) => file.path === "page.tsx") ||
             validFiles[0];
 
-          globalJobStore.completeJob(reqId, {
+          await globalJobStore.completeJobAsync(reqId, {
             files: validFiles,
             dependencies: pipelineResult.dependencies,
             generatedCode: mainFile?.code || "",
@@ -246,12 +373,24 @@ export async function POST(request: Request, context?: unknown) {
           const statusCode = getErrorStatusCode(jobErr);
           const rawMessage = jobErr instanceof Error ? jobErr.message : "Unknown generation error.";
           const safeMessage = sanitizeErrorMessage(rawMessage);
-          globalJobStore.failJob(reqId, safeMessage, statusCode);
+          await globalJobStore.failJobAsync(reqId, safeMessage, statusCode).catch((err) => {
+            console.warn(`[Req ${reqId}] Failed to persist job failure:`, err);
+          });
+        } finally {
+          heartbeat.stop();
+          if (resumeJobId) {
+            await globalJobStore.releaseResumeLock(resumeJobId, reqId).catch(() => {});
+          }
+          await globalJobStore.releaseResumeLock(reqId, reqId).catch(() => {});
         }
       })().catch((unhandledErr) => {
         const statusCode = getErrorStatusCode(unhandledErr);
         const rawMessage = unhandledErr instanceof Error ? unhandledErr.message : "Unexpected background task failure.";
-        globalJobStore.failJob(reqId, sanitizeErrorMessage(rawMessage), statusCode);
+        void globalJobStore.failJobAsync(reqId, sanitizeErrorMessage(rawMessage), statusCode).catch(() => {});
+        if (resumeJobId) {
+          void globalJobStore.releaseResumeLock(resumeJobId, reqId).catch(() => {});
+        }
+        void globalJobStore.releaseResumeLock(reqId, reqId).catch(() => {});
       });
 
       return NextResponse.json({
@@ -265,16 +404,28 @@ export async function POST(request: Request, context?: unknown) {
 
     console.log(`[Req ${reqId}] Calling ModelRouter (${providerType}, model: ${modelToUse}) with recovery pipeline (sync mode)...`);
 
-    const pipelineResult = await executeGenerationPipeline({
-      modelRouter,
-      provider: providerType,
-      model: modelToUse,
-      userPrompt: prompt,
-      requestId: reqId,
-      disableFallback: true,
-      maxContinuationAttempts: 2,
-      concurrencyLimiter: activeConcurrencyLimiter,
-    });
+    const syncJobIds = resumeJobId ? [reqId, resumeJobId] : [reqId];
+    const syncHeartbeat = startJobHeartbeat(syncJobIds, reqId);
+    let pipelineResult: import("@/lib/jsonRecovery").PipelineExecutionResult;
+
+    try {
+      pipelineResult = await executeGenerationPipeline({
+        modelRouter: activeModelRouter,
+        provider: providerType,
+        model: modelToUse,
+        userPrompt: prompt,
+        requestId: reqId,
+        disableFallback: true,
+        maxContinuationAttempts: 2,
+        concurrencyLimiter: activeConcurrencyLimiter,
+      });
+    } finally {
+      syncHeartbeat.stop();
+      if (resumeJobId) {
+        await globalJobStore.releaseResumeLock(resumeJobId, reqId).catch(() => {});
+      }
+      await globalJobStore.releaseResumeLock(reqId, reqId).catch(() => {});
+    }
 
     const validFiles = pipelineResult.files;
     const mainFile =
@@ -305,6 +456,11 @@ export async function POST(request: Request, context?: unknown) {
       timings: pipelineResult.timings,
     });
   } catch (error) {
+    if (resumeJobId) {
+      void globalJobStore.releaseResumeLock(resumeJobId, reqId).catch(() => {});
+    }
+    void globalJobStore.releaseResumeLock(reqId, reqId).catch(() => {});
+
     const totalDuration = Date.now() - startTime;
     console.error(`[Req ${serverReqId}] API error after ${totalDuration}ms:`, error);
 

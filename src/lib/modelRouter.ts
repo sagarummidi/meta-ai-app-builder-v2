@@ -707,7 +707,13 @@ export function sanitizeErrorMessage(message: string): string {
     sanitized = sanitized.split(configuredKey).join("[REDACTED]");
   }
 
+  const configuredDbUrl = (process.env.DATABASE_URL || process.env.POSTGRES_URL)?.trim();
+  if (configuredDbUrl && configuredDbUrl.length > 0) {
+    sanitized = sanitized.split(configuredDbUrl).join("[REDACTED]");
+  }
+
   return sanitized
+    .replace(/(postgres(?:ql)?:\/\/[^:]+:)([^@\s]+)(@)/gi, "$1[REDACTED]$3")
     .replace(/meta[-_][A-Za-z0-9_-]+/gi, "[REDACTED]")
     .replace(/nvapi-[A-Za-z0-9_-]+/g, "[REDACTED]")
     .replace(/nebius[-_][A-Za-z0-9_-]+/gi, "[REDACTED]")
