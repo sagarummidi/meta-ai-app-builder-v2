@@ -272,32 +272,34 @@ describe("Phase 3: Durable Generation Job Persistence", () => {
   // ---------------------------------------------------------------------------
   // Test 6: Production Safety - Rejects Missing DB in Production & Masks Secrets
   // ---------------------------------------------------------------------------
-  test("enforces database requirement in production and masks database connection secrets", () => {
-    const originalEnv = process.env.NODE_ENV;
-    const originalDbUrl = process.env.DATABASE_URL;
-    const originalPgUrl = process.env.POSTGRES_URL;
+  test("enforces database requirement in production and masks database connection secrets", async () => {
+    const keys = ["NODE_ENV", "DATABASE_URL", "POSTGRES_URL"] as const;
+    const previous = new Map(keys.map((key) => [key, process.env[key]]));
 
     try {
-      (process.env as any).NODE_ENV = "production";
+      process.env.NODE_ENV = "production";
       delete process.env.DATABASE_URL;
       delete process.env.POSTGRES_URL;
 
-      // In production with no DATABASE_URL, instantiation must throw an actionable error
-      assert.throws(
-        () => new GenerationJobStoreManager(),
-        /Production database configuration missing: Set DATABASE_URL or POSTGRES_URL/
+      // Keep module/route initialization safe, but fail actual durable job operations clearly.
+      const store = new GenerationJobStoreManager();
+      await assert.rejects(
+        () => store.getJobAsync("production-db-required"),
+        /Production database configuration missing: set DATABASE_URL or POSTGRES_URL/
       );
 
-      // Verify secret masking for connection string errors
+      // Verify secret masking for connection string errors.
       const sensitiveError =
         "connection to server at postgres://user:supersecretpass@roundhouse.proxy.rlwy.net:12345/db failed";
       const masked = sanitizeErrorMessage(sensitiveError);
       assert.ok(!masked.includes("supersecretpass"), "Database password must not appear in sanitized message");
       assert.ok(masked.includes("[REDACTED]") || !masked.includes("user:supersecretpass"));
     } finally {
-      (process.env as any).NODE_ENV = originalEnv;
-      if (originalDbUrl) process.env.DATABASE_URL = originalDbUrl;
-      if (originalPgUrl) process.env.POSTGRES_URL = originalPgUrl;
+      for (const key of keys) {
+        const value = previous.get(key);
+        if (value === undefined) delete process.env[key];
+        else process.env[key] = value;
+      }
     }
   });
 

@@ -679,7 +679,7 @@ export class MetaProvider implements ModelProvider {
         throw upstreamErr;
       }
 
-      const contentType = response.headers.get("content-type") || "";
+      const contentType = response.headers?.get?.("content-type") || "";
       if (contentType.toLowerCase().includes("text/event-stream")) {
         try {
           const streamed = await extractTextFromMetaStream(response);
