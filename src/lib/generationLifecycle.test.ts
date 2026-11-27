@@ -42,15 +42,15 @@ class MockLifecycleProvider implements ModelProvider {
   }
 }
 
-describe("Meta Muse Spark 10-Minute Generation Lifecycle & Timeout Hardening", () => {
+describe("Meta Muse Spark 15-Minute Generation Lifecycle & Timeout Hardening", () => {
   beforeEach(() => {
     globalJobStore.clear();
   });
 
   // 1. A generation taking several minutes can complete successfully
-  test("1. A generation taking several minutes can complete successfully within 10-minute window", async () => {
-    assert.equal(MAX_GENERATION_DURATION_MS, 600000); // 10 minutes
-    assert.equal(DEFAULT_PROVIDER_TIMEOUT_MS, 600000);
+  test("1. A generation taking several minutes can complete successfully within 15-minute window", async () => {
+    assert.equal(MAX_GENERATION_DURATION_MS, 900000); // 15 minutes
+    assert.equal(DEFAULT_PROVIDER_TIMEOUT_MS, 900000);
 
     const planJson = JSON.stringify({
       files: [
@@ -89,7 +89,7 @@ export default function App() {
     const jobId = "job-10m-success";
     globalJobStore.createJob(jobId, "Build a todo app", "meta", "muse-spark-1.3");
 
-    // Execute with default 10-minute timeout
+    // Execute with default 15-minute timeout
     const result = await executeStagedGenerationPipeline({
       modelRouter: router,
       provider: "meta",
@@ -160,8 +160,8 @@ export default function App() {
     // Verify the timeout allocated to the provider call is bounded by the 10-minute window (e.g. ~590s - 600s),
     // and was NOT prematurely restricted to 60s or 180s
     assert.ok(
-      observedCallTimeoutMs > 550000,
-      `Expected call timeout to be close to 600,000ms (10m), but got ${observedCallTimeoutMs}ms`
+      observedCallTimeoutMs > 850000,
+      `Expected call timeout to be close to 900,000ms (15m), but got ${observedCallTimeoutMs}ms`
     );
   });
 
@@ -247,7 +247,7 @@ export default function App() {
   });
 
   // 4. A generation job remains active within its permitted execution window
-  test("4. A generation job remains active within its permitted execution window (e.g. at 9 minutes)", async () => {
+  test("4. A generation job remains active within its permitted execution window (e.g. at 14 minutes)", async () => {
     const jobId = "job-active-9m";
     const job = globalJobStore.createJob(jobId, "Long generating prompt", "meta", "muse-spark-1.3");
     globalJobStore.updateJobProgress(jobId, {
@@ -256,8 +256,8 @@ export default function App() {
       progressPercent: 80,
     });
 
-    // Simulate 9 minutes of execution time (540,000 ms elapsed, within 10-minute / 10.5-minute window)
-    job.createdAt = Date.now() - (9 * 60 * 1000);
+    // Simulate 14 minutes of execution time (840,000 ms elapsed, within 15-minute / 15.5-minute window)
+    job.createdAt = Date.now() - (14 * 60 * 1000);
 
     const fetched = globalJobStore.getJob(jobId);
     assert.ok(fetched);
@@ -275,8 +275,8 @@ export default function App() {
   });
 
   // 5. A job exceeding the deadline transitions to failed
-  test("5. A job exceeding the deadline transitions to failed (MAX_JOB_ACTIVE_DURATION_MS = 630,000ms)", async () => {
-    assert.equal(MAX_JOB_ACTIVE_DURATION_MS, 630000); // 10.5 minutes (10m + 30s grace period)
+  test("5. A job exceeding the deadline transitions to failed (MAX_JOB_ACTIVE_DURATION_MS = 930,000ms)", async () => {
+    assert.equal(MAX_JOB_ACTIVE_DURATION_MS, 930000); // 15.5 minutes (15m + 30s grace period)
     assert.equal(MAX_JOB_CLEANUP_GRACE_PERIOD_MS, 30000);
 
     const jobId = "job-exceeded-10m";
@@ -288,14 +288,14 @@ export default function App() {
       completedFilePaths: ["types.ts"],
     });
 
-    // Simulate elapsed time exceeding 10.5 minutes (630,000 ms + 1,000 ms)
+    // Simulate elapsed time exceeding 15.5 minutes (930,000 ms + 1,000 ms)
     job.createdAt = Date.now() - (MAX_JOB_ACTIVE_DURATION_MS + 1000);
 
     const fetched = globalJobStore.getJob(jobId);
     assert.ok(fetched);
     assert.equal(fetched.status, "failed");
     assert.equal(fetched.statusCode, 504);
-    assert.match(fetched.error || "", /exceeded maximum execution time \(10m\)/);
+    assert.match(fetched.error || "", /exceeded maximum execution time \(15m\)/);
 
     // Polling GET returns 504 and preserves completedFilePaths
     const pollReq = new Request(`http://localhost/api/generate?jobId=${jobId}`, { method: "GET" });
@@ -308,10 +308,10 @@ export default function App() {
   });
 
   // 6. Frontend polling does not expire before the backend deadline
-  test("6. Frontend polling does not expire before backend deadline (11 minutes vs 10 minutes)", () => {
+  test("6. Frontend polling does not expire before backend deadline (16 minutes vs 15 minutes)", () => {
     const pollIntervalMs = 1500;
-    const maxPollAttempts = 440;
-    const totalClientPollingDurationMs = maxPollAttempts * pollIntervalMs; // 660,000 ms = 11 minutes
+    const maxPollAttempts = 640;
+    const totalClientPollingDurationMs = maxPollAttempts * pollIntervalMs; // 960,000 ms = 16 minutes
     const backendDeadlineMs = MAX_GENERATION_DURATION_MS; // 600,000 ms = 10 minutes
     const backendMaxActiveMs = MAX_JOB_ACTIVE_DURATION_MS; // 630,000 ms = 10.5 minutes
 
