@@ -48,10 +48,10 @@ export interface GenerationJob {
 }
 
 export const DEFAULT_JOB_TTL_MS = 60 * 60 * 1000; // 1 hour TTL default
-export const MAX_GENERATION_DURATION_MS = 10 * 60 * 1000; // 10 minutes (600,000 ms)
+export const MAX_GENERATION_DURATION_MS = 15 * 60 * 1000; // 15 minutes (900,000 ms)
 export const MAX_JOB_CLEANUP_GRACE_PERIOD_MS = 30 * 1000; // 30 seconds grace period
 export const MAX_JOB_ACTIVE_DURATION_MS =
-  MAX_GENERATION_DURATION_MS + MAX_JOB_CLEANUP_GRACE_PERIOD_MS; // 630,000 ms (10.5 minutes)
+  MAX_GENERATION_DURATION_MS + MAX_JOB_CLEANUP_GRACE_PERIOD_MS; // 930,000 ms (15.5 minutes)
 export const DEFAULT_STALE_JOB_THRESHOLD_MS = 60 * 1000; // 1 minute without progress indicates interrupted job
 export const DEFAULT_RESUME_LOCK_TTL_MS = 60 * 1000; // 1 minute distributed resume lock TTL
 
@@ -199,7 +199,7 @@ export class MemoryJobStore implements IGenerationJobStore {
 
     if (isActive && (isOverMaxDuration || isStale)) {
       const errorMsg = isOverMaxDuration
-        ? "Generation job exceeded maximum execution time (10m). Upstream model took too long to complete."
+        ? "Generation job exceeded maximum execution time (15m). Upstream model took too long to complete."
         : `Generation job was interrupted by a server restart. Preserved ${job.partialFiles?.length || 0} generated files. Use resumeJobId to continue generating remaining ${job.pendingFilePaths?.length || 0} files.`;
 
       this.failJob(id, errorMsg, 504);
