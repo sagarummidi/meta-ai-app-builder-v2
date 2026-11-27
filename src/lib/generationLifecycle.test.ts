@@ -157,7 +157,7 @@ export default function App() {
       disableFallback: true,
     });
 
-    // Verify the timeout allocated to the provider call is bounded by the 10-minute window (e.g. ~590s - 600s),
+    // Verify the timeout allocated to the provider call is bounded by the 15-minute window (e.g. ~890s - 900s),
     // and was NOT prematurely restricted to 60s or 180s
     assert.ok(
       observedCallTimeoutMs > 850000,
@@ -303,7 +303,7 @@ export default function App() {
     assert.equal(pollRes.status, 504);
     const pollBody = await pollRes.json();
     assert.equal(pollBody.success, false);
-    assert.match(pollBody.error, /exceeded maximum execution time \(10m\)/);
+    assert.match(pollBody.error, /exceeded maximum execution time \(15m\)/);
     assert.deepEqual(pollBody.completedFilePaths, ["types.ts"]);
   });
 
@@ -315,7 +315,7 @@ export default function App() {
     const backendDeadlineMs = MAX_GENERATION_DURATION_MS; // 600,000 ms = 10 minutes
     const backendMaxActiveMs = MAX_JOB_ACTIVE_DURATION_MS; // 630,000 ms = 10.5 minutes
 
-    assert.equal(totalClientPollingDurationMs, 11 * 60 * 1000);
+    assert.equal(totalClientPollingDurationMs, 16 * 60 * 1000);
     assert.ok(
       totalClientPollingDurationMs > backendMaxActiveMs,
       "Client polling window must exceed the backend maximum active job duration"
