@@ -15,7 +15,7 @@ test("production without a database URL fails job operations explicitly without 
 
   try {
     for (const key of keys) delete process.env[key];
-    (process.env as any).NODE_ENV = "production";
+    Reflect.set(process.env, "NODE_ENV", "production");
 
     const store = new GenerationJobStoreManager();
     await assert.rejects(
@@ -26,7 +26,7 @@ test("production without a database URL fails job operations explicitly without 
     for (const key of keys) {
       const value = previous.get(key);
       if (value === undefined) delete process.env[key];
-      else (process.env as any)[key] = value;
+      else Reflect.set(process.env, key, value);
     }
   }
 });

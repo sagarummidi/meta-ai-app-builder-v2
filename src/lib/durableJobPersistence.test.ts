@@ -1,4 +1,4 @@
-import { test, describe, beforeEach, afterEach } from "node:test";
+import { test, describe } from "node:test";
 import assert from "node:assert/strict";
 import {
   PostgresJobStore,
@@ -6,7 +6,6 @@ import {
   GenerationJobStoreManager,
   globalJobStore,
   mergeJobFiles,
-  type GenerationJob,
   type GenerationJobResult,
   type IDatabaseClient,
 } from "./generationJobs";
@@ -100,6 +99,8 @@ describe("Phase 3: Durable Generation Job Persistence", () => {
   // ---------------------------------------------------------------------------
   test("recovers job state after simulated server restart without losing completed files", async () => {
     // Shared underlying storage simulates a database table surviving container restarts
+    // Mock SQL rows intentionally model heterogeneous database columns.
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
     const sharedDbRows = new Map<string, any>();
 
     const mockDb: IDatabaseClient = {
@@ -277,7 +278,7 @@ describe("Phase 3: Durable Generation Job Persistence", () => {
     const previous = new Map(keys.map((key) => [key, process.env[key]]));
 
     try {
-      (process.env as any).NODE_ENV = "production";
+      Reflect.set(process.env, "NODE_ENV", "production");
       delete process.env.DATABASE_URL;
       delete process.env.POSTGRES_URL;
 
@@ -298,7 +299,7 @@ describe("Phase 3: Durable Generation Job Persistence", () => {
       for (const key of keys) {
         const value = previous.get(key);
         if (value === undefined) delete process.env[key];
-        else (process.env as any)[key] = value;
+        else Reflect.set(process.env, key, value);
       }
     }
   });

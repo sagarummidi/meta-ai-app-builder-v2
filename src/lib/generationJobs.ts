@@ -1,5 +1,5 @@
 import type { GeneratedFile, PipelineTimingInfo, PlannedFile } from "./jsonRecovery";
-import { Pool, type QueryResult } from "pg";
+import { Pool, type QueryResult, type QueryResultRow } from "pg";
 import { sanitizeErrorMessage } from "./modelRouter";
 
 export type GenerationJobStatus =
@@ -374,7 +374,7 @@ export class MemoryJobStore implements IGenerationJobStore {
 // PostgreSQL Durable Storage Implementation (for Production & Multi-Instance)
 // -----------------------------------------------------------------------------
 export interface IDatabaseClient {
-  query(text: string, params?: unknown[]): Promise<QueryResult<any>>;
+  query(text: string, params?: unknown[]): Promise<QueryResult<QueryResultRow>>;
 }
 
 export class PostgresJobStore implements IGenerationJobStore {
@@ -471,7 +471,7 @@ export class PostgresJobStore implements IGenerationJobStore {
     return this.initPromise;
   }
 
-  private mapRowToJob(row: any): GenerationJob {
+  private mapRowToJob(row: QueryResultRow): GenerationJob {
     return {
       id: row.id,
       prompt: row.prompt,
@@ -997,7 +997,7 @@ export class GenerationJobStoreManager implements IGenerationJobStore {
 
   public getJob(id: string): GenerationJob | undefined {
     const storeRes = this.activeStore.getJob(id);
-    if (storeRes && typeof (storeRes as Promise<any>).then !== "function") {
+    if (storeRes && typeof (storeRes as Promise<GenerationJob | undefined>).then !== "function") {
       const job = storeRes as GenerationJob;
       this.memoryCache.set(id, job);
       return job;
@@ -1054,14 +1054,14 @@ export class GenerationJobStoreManager implements IGenerationJobStore {
       version: 1,
     };
     const storeRes = this.activeStore.createJob(id, prompt, provider, model, initialFiles, initialManifest);
-    if (storeRes && typeof (storeRes as Promise<any>).then !== "function") {
+    if (storeRes && typeof (storeRes as Promise<GenerationJob | undefined>).then !== "function") {
       const activeJob = storeRes as GenerationJob;
       this.memoryCache.set(id, activeJob);
       return activeJob;
     }
     this.memoryCache.set(id, job);
-    if (storeRes && typeof (storeRes as Promise<any>).catch === "function") {
-      (storeRes as Promise<any>).catch((err) => {
+    if (storeRes && typeof (storeRes as Promise<GenerationJob | undefined>).catch === "function") {
+      (storeRes as Promise<GenerationJob | undefined>).catch((err) => {
         console.warn(`[JobStore] Background persistence error for job ${id}:`, err);
       });
     }
@@ -1133,13 +1133,13 @@ export class GenerationJobStoreManager implements IGenerationJobStore {
     }
 
     const storeRes = this.activeStore.updateJobProgress(id, updates);
-    if (storeRes && typeof (storeRes as Promise<any>).then !== "function") {
+    if (storeRes && typeof (storeRes as Promise<GenerationJob | undefined>).then !== "function") {
       const activeJob = storeRes as GenerationJob;
       this.memoryCache.set(id, activeJob);
       return activeJob;
     }
-    if (storeRes && typeof (storeRes as Promise<any>).catch === "function") {
-      (storeRes as Promise<any>).catch((err) => {
+    if (storeRes && typeof (storeRes as Promise<GenerationJob | undefined>).catch === "function") {
+      (storeRes as Promise<GenerationJob | undefined>).catch((err) => {
         console.warn(`[JobStore] Background update error for job ${id}:`, err);
       });
     }
@@ -1182,13 +1182,13 @@ export class GenerationJobStoreManager implements IGenerationJobStore {
     }
 
     const storeRes = this.activeStore.completeJob(id, result);
-    if (storeRes && typeof (storeRes as Promise<any>).then !== "function") {
+    if (storeRes && typeof (storeRes as Promise<GenerationJob | undefined>).then !== "function") {
       const activeJob = storeRes as GenerationJob;
       this.memoryCache.set(id, activeJob);
       return activeJob;
     }
-    if (storeRes && typeof (storeRes as Promise<any>).catch === "function") {
-      (storeRes as Promise<any>).catch((err) => {
+    if (storeRes && typeof (storeRes as Promise<GenerationJob | undefined>).catch === "function") {
+      (storeRes as Promise<GenerationJob | undefined>).catch((err) => {
         console.warn(`[JobStore] Background completion error for job ${id}:`, err);
       });
     }
@@ -1216,13 +1216,13 @@ export class GenerationJobStoreManager implements IGenerationJobStore {
     }
 
     const storeRes = this.activeStore.failJob(id, error, statusCode);
-    if (storeRes && typeof (storeRes as Promise<any>).then !== "function") {
+    if (storeRes && typeof (storeRes as Promise<GenerationJob | undefined>).then !== "function") {
       const activeJob = storeRes as GenerationJob;
       this.memoryCache.set(id, activeJob);
       return activeJob;
     }
-    if (storeRes && typeof (storeRes as Promise<any>).catch === "function") {
-      (storeRes as Promise<any>).catch((err) => {
+    if (storeRes && typeof (storeRes as Promise<GenerationJob | undefined>).catch === "function") {
+      (storeRes as Promise<GenerationJob | undefined>).catch((err) => {
         console.warn(`[JobStore] Background failure error for job ${id}:`, err);
       });
     }
@@ -1272,8 +1272,8 @@ export class GenerationJobStoreManager implements IGenerationJobStore {
   public clear(): void {
     this.memoryCache.clear();
     const storeRes = this.activeStore.clear();
-    if (storeRes && typeof (storeRes as Promise<any>).catch === "function") {
-      (storeRes as Promise<any>).catch(() => {});
+    if (storeRes && typeof (storeRes as Promise<GenerationJob | undefined>).catch === "function") {
+      (storeRes as Promise<GenerationJob | undefined>).catch(() => {});
     }
   }
 
