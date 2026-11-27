@@ -9,6 +9,7 @@ import {
 import type { GenerationJobStatus } from "./generationJobs";
 import { normalizeWorkspacePath } from "./agent/fileOps";
 import type { ConcurrencyLimiter } from "./rateLimiter";
+import { GENERATION_SKILL_GUIDANCE } from "./generationSkill";
 
 export interface GeneratedFile {
   path: string;
@@ -2022,7 +2023,7 @@ export async function executeStagedGenerationPipeline(
       modelRouter.generateWithFallback(
         {
           model,
-          input: promptText,
+          input: `${GENERATION_SKILL_GUIDANCE}\n\n${promptText}`,
           generationConfig: {
             thinking_level: "low",
           },
