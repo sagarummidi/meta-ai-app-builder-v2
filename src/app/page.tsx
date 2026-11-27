@@ -969,7 +969,7 @@ export default function Home() {
         const activeJobId = (data as { jobId: string }).jobId;
         let jobCompleted = false;
         let pollAttempts = 0;
-        const maxPollAttempts = 440; // 11 minutes total polling window at ~1.5s interval (660s)
+        const maxPollAttempts = 640; // 16 minutes total polling window at ~1.5s interval (960s)
         let consecutiveNetworkErrors = 0;
 
         while (!jobCompleted && pollAttempts < maxPollAttempts) {
