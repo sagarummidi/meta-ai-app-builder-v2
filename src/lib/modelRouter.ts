@@ -398,6 +398,134 @@ export function extractTextFromMetaResponse(data: unknown): MetaExtractedRespons
   };
 }
 
+/**
+ * Reads Meta Chat Completions server-sent events and accumulates the final text.
+ * Streaming avoids the upstream non-streaming gateway timeout on long generations.
+ */
+export async function extractTextFromMetaStream(response: Response): Promise<MetaExtractedResponse> {
+  const streamError = (message: string): never => {
+    const error = new Error(sanitizeErrorMessage(message));
+    (error as unknown as { status: number; statusCode: number }).status = 502;
+    (error as unknown as { status: number; statusCode: number }).statusCode = 502;
+    throw error;
+  };
+
+  if (!response.body) return streamError("Meta API returned an empty streaming response body.");
+
+  const reader = response.body.getReader();
+  const decoder = new TextDecoder();
+  let buffer = "";
+  let dataLines: string[] = [];
+  let outputText = "";
+  let finishReason: string | undefined;
+  let rawUsage: MetaExtractedResponse["rawUsage"];
+
+  const dispatchEvent = () => {
+    if (dataLines.length === 0) return;
+    const rawData = dataLines.join("\n").trim();
+    dataLines = [];
+    if (!rawData || rawData === "[DONE]") return;
+
+    let parsed: unknown;
+    try {
+      parsed = JSON.parse(rawData);
+    } catch {
+      return streamError("Meta API returned malformed JSON in a streaming event.");
+    }
+    if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+      return streamError("Meta API returned an invalid streaming event.");
+    }
+
+    const payload = parsed as Record<string, unknown>;
+    if (payload.error) {
+      const errorValue = payload.error;
+      const detail = typeof errorValue === "string"
+        ? errorValue
+        : errorValue && typeof errorValue === "object" &&
+            typeof (errorValue as Record<string, unknown>).message === "string"
+          ? String((errorValue as Record<string, unknown>).message)
+          : "Unknown upstream error";
+      return streamError("Meta API streaming error: " + detail);
+    }
+
+    if (Array.isArray(payload.choices) && payload.choices.length > 0) {
+      const choice = payload.choices[0] as Record<string, unknown> | undefined;
+      if (choice && typeof choice === "object") {
+        const delta = choice.delta && typeof choice.delta === "object"
+          ? choice.delta as Record<string, unknown>
+          : undefined;
+
+        if (typeof delta?.refusal === "string" && delta.refusal.trim()) {
+          return streamError("Meta model refused to generate completion: " + delta.refusal.trim());
+        }
+
+        const content = delta?.content;
+        if (typeof content === "string") {
+          outputText += content;
+        } else if (Array.isArray(content)) {
+          for (const part of content) {
+            if (part && typeof part === "object" &&
+                typeof (part as Record<string, unknown>).text === "string") {
+              outputText += String((part as Record<string, unknown>).text);
+            }
+          }
+        }
+
+        if (typeof choice.finish_reason === "string") finishReason = choice.finish_reason;
+      }
+    }
+
+    if (payload.usage && typeof payload.usage === "object") {
+      const usage = payload.usage as Record<string, unknown>;
+      rawUsage = {
+        promptTokens: typeof usage.prompt_tokens === "number" ? usage.prompt_tokens : undefined,
+        completionTokens: typeof usage.completion_tokens === "number" ? usage.completion_tokens : undefined,
+        totalTokens: typeof usage.total_tokens === "number" ? usage.total_tokens : undefined,
+      };
+    }
+  };
+
+  const processLine = (line: string) => {
+    if (line === "") {
+      dispatchEvent();
+      return;
+    }
+    if (line.startsWith(":")) return;
+    const separator = line.indexOf(":");
+    const field = separator === -1 ? line : line.slice(0, separator);
+    if (field === "data") {
+      const value = separator === -1 ? "" : line.slice(separator + 1);
+      dataLines.push(value.startsWith(" ") ? value.slice(1) : value);
+    }
+  };
+
+  try {
+    while (true) {
+      const { value, done } = await reader.read();
+      if (done) break;
+      buffer += decoder.decode(value, { stream: true });
+      const lines = buffer.split(/\r?\n/);
+      buffer = lines.pop() ?? "";
+      for (const line of lines) processLine(line);
+    }
+    buffer += decoder.decode();
+    if (buffer) processLine(buffer);
+    dispatchEvent();
+  } finally {
+    reader.releaseLock();
+  }
+
+  if (!outputText.trim()) return streamError("Meta returned a streaming completion without text content.");
+
+  const normalizedFinishReason = finishReason?.trim().toLowerCase();
+  return {
+    outputText,
+    finishReason,
+    truncated: normalizedFinishReason === "length" || normalizedFinishReason === "max_tokens",
+    rawUsage,
+  };
+}
+
 export class MetaProvider implements ModelProvider {
   name: ModelProviderType = "meta";
   private config?: MetaProviderConfig;
@@ -442,6 +570,7 @@ export class MetaProvider implements ModelProvider {
       ],
       temperature: request.generationConfig?.temperature ?? 0.2,
       max_tokens: request.generationConfig?.maxOutputTokens ?? 8192,
+      stream: true,
     };
 
     if (request.responseFormat?.mime_type === "application/json") {
@@ -465,6 +594,7 @@ export class MetaProvider implements ModelProvider {
           method: "POST",
           headers: {
             "Content-Type": "application/json",
+            Accept: "text/event-stream",
             Authorization: `Bearer ${apiKey}`,
           },
           body: JSON.stringify(bodyPayload),
@@ -547,6 +677,34 @@ export class MetaProvider implements ModelProvider {
         (upstreamErr as unknown as { status: number; statusCode: number }).status = response.status;
         (upstreamErr as unknown as { status: number; statusCode: number }).statusCode = response.status;
         throw upstreamErr;
+      }
+
+      const contentType = response.headers?.get?.("content-type") || "";
+      if (contentType.toLowerCase().includes("text/event-stream")) {
+        try {
+          const streamed = await extractTextFromMetaStream(response);
+          return {
+            outputText: streamed.outputText,
+            finishReason: streamed.finishReason,
+            truncated: streamed.truncated,
+            rawUsage: streamed.rawUsage,
+          };
+        } catch (streamError) {
+          const isTimeout = timedOut ||
+            (streamError instanceof Error &&
+              (streamError.name === "TimeoutError" ||
+                streamError.name === "AbortError" ||
+                /timeout/i.test(streamError.message)));
+          if (isTimeout) {
+            const timeoutErr = new Error(
+              "Meta API streaming request timed out after " + Math.round(timeoutMs / 1000) + "s."
+            );
+            (timeoutErr as unknown as { status: number; statusCode: number }).status = 504;
+            (timeoutErr as unknown as { status: number; statusCode: number }).statusCode = 504;
+            throw timeoutErr;
+          }
+          throw streamError;
+        }
       }
 
       let data: unknown;
@@ -707,7 +865,13 @@ export function sanitizeErrorMessage(message: string): string {
     sanitized = sanitized.split(configuredKey).join("[REDACTED]");
   }
 
+  const configuredDbUrl = (process.env.DATABASE_URL || process.env.POSTGRES_URL)?.trim();
+  if (configuredDbUrl && configuredDbUrl.length > 0) {
+    sanitized = sanitized.split(configuredDbUrl).join("[REDACTED]");
+  }
+
   return sanitized
+    .replace(/(postgres(?:ql)?:\/\/[^:]+:)([^@\s]+)(@)/gi, "$1[REDACTED]$3")
     .replace(/meta[-_][A-Za-z0-9_-]+/gi, "[REDACTED]")
     .replace(/nvapi-[A-Za-z0-9_-]+/g, "[REDACTED]")
     .replace(/nebius[-_][A-Za-z0-9_-]+/gi, "[REDACTED]")

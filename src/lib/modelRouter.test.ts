@@ -155,7 +155,34 @@ describe("MetaProvider: Meta AI Endpoint & Payload Construction", () => {
     assert.equal(capturedBody.temperature, 0.3);
     assert.equal(capturedBody.max_tokens, 4096);
     assert.deepEqual(capturedBody.response_format, { type: "json_object" });
+    assert.equal(capturedBody.stream, true);
     assert.match(result.outputText, /Meta App/);
+  });
+
+  test("streams long Meta generations and preserves truncation metadata", async () => {
+    let capturedBody: Record<string, unknown> = {};
+    const events = [
+      { choices: [{ delta: { role: "assistant" }, finish_reason: null }] },
+      { choices: [{ delta: { content: '{"files":[' }, finish_reason: null }] },
+      { choices: [{ delta: { content: '{"path":"App.tsx","code":"export default () => <div>Streamed</div>;"}' }, finish_reason: null }] },
+      { choices: [{ delta: {}, finish_reason: "length" }] },
+    ];
+    const sseBody = events.map((event) => "data: " + JSON.stringify(event) + "\n\n").join("") + "data: [DONE]\n\n";
+    const mockFetch = (async (_url: string | URL | Request, init?: RequestInit) => {
+      capturedBody = JSON.parse(String(init?.body || "{}"));
+      return new Response(sseBody, {
+        status: 200,
+        headers: { "Content-Type": "text/event-stream; charset=utf-8" },
+      });
+    }) as unknown as typeof fetch;
+
+    const provider = new MetaProvider({ apiKey: "stream-test-key", fetchFn: mockFetch });
+    const result = await provider.generate({ input: "Build an app", model: "muse-spark-1.3" });
+
+    assert.equal(capturedBody.stream, true);
+    assert.match(result.outputText, /Streamed/);
+    assert.equal(result.finishReason, "length");
+    assert.equal(result.truncated, true);
   });
 
   test("Handles 401 authentication error cleanly with 401 status", async () => {

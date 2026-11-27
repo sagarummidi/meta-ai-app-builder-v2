@@ -14,6 +14,21 @@ export interface MetaResponsesClientConfig {
   baseUrl?: string;
   apiKey?: string;
   fetchFn?: typeof fetch;
+  timeoutMs?: number;
+}
+
+export const DEFAULT_META_AGENT_TIMEOUT_MS = 120_000;
+export const MAX_META_AGENT_TIMEOUT_MS = 180_000;
+
+export function resolveMetaAgentTimeoutMs(configuredTimeoutMs?: number): number {
+  const envTimeout = Number(process.env.META_AGENT_TIMEOUT_MS);
+  const candidate = configuredTimeoutMs ?? (
+    Number.isFinite(envTimeout) && envTimeout > 0
+      ? envTimeout
+      : DEFAULT_META_AGENT_TIMEOUT_MS
+  );
+  if (!Number.isFinite(candidate) || candidate <= 0) return DEFAULT_META_AGENT_TIMEOUT_MS;
+  return Math.min(Math.floor(candidate), MAX_META_AGENT_TIMEOUT_MS);
 }
 
 export interface ResponsesToolFunction {
@@ -173,102 +188,140 @@ export class MetaResponsesClient {
     }
 
     const fetchFunc = this.config?.fetchFn || fetch;
+    const timeoutMs = resolveMetaAgentTimeoutMs(this.config?.timeoutMs);
+    const controller = new AbortController();
+    let timedOut = false;
+    const timeout = setTimeout(() => {
+      timedOut = true;
+      controller.abort(new Error("Meta Responses API request timed out."));
+    }, timeoutMs);
 
-    let response: Response;
-    try {
-      response = await fetchFunc(endpoint, {
-        method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-          Authorization: `Bearer ${apiKey}`,
-        },
-        body: JSON.stringify(payload),
-        signal: AbortSignal.timeout(90000),
-      });
-    } catch (networkError) {
-      const baseMsg =
-        networkError instanceof Error ? networkError.message : "Unknown network error";
-      const netErr = new Error(
-        sanitizeErrorMessage(`Meta Responses API network request failed: ${baseMsg}`)
+    const timeoutError = () => {
+      const error = new Error(
+        "Meta Responses API request timed out after " + Math.round(timeoutMs / 1000) + "s."
       );
-      (netErr as unknown as { status: number; statusCode: number }).status = 503;
-      (netErr as unknown as { status: number; statusCode: number }).statusCode = 503;
-      throw netErr;
-    }
-
-    if (!response.ok) {
-      let errorBody = "";
-      try {
-        errorBody = await response.text();
-      } catch {
-        errorBody = "";
-      }
-
-      if (response.status === 401) {
-        const authErr = new Error(
-          "Meta API authentication failed (401). Please check MODEL_API_KEY."
-        );
-        (authErr as unknown as { status: number; statusCode: number }).status = 401;
-        (authErr as unknown as { status: number; statusCode: number }).statusCode = 401;
-        throw authErr;
-      }
-      if (response.status === 429) {
-        const rateErr = new Error(
-          "Meta API rate limit exceeded (429). Please try again later."
-        );
-        (rateErr as unknown as { status: number; statusCode: number }).status = 429;
-        (rateErr as unknown as { status: number; statusCode: number }).statusCode = 429;
-        throw rateErr;
-      }
-
-      const statusText = response.statusText ? ` ${response.statusText}` : "";
-      const detailMsg = errorBody ? ` Details: ${errorBody}` : "";
-      const upstreamErr = new Error(
-        sanitizeErrorMessage(
-          `Meta Responses API error (${response.status}):${statusText || " Upstream failure"}${detailMsg}`
-        )
-      );
-      (upstreamErr as unknown as { status: number; statusCode: number }).status =
-        response.status;
-      (upstreamErr as unknown as { status: number; statusCode: number }).statusCode =
-        response.status;
-      throw upstreamErr;
-    }
-
-    let data: unknown;
-    try {
-      data = await response.json();
-    } catch {
-      const parseErr = new Error("Failed to parse JSON response from Meta Responses API.");
-      (parseErr as unknown as { status: number; statusCode: number }).status = 502;
-      (parseErr as unknown as { status: number; statusCode: number }).statusCode = 502;
-      throw parseErr;
-    }
-
-    if (!data || typeof data !== "object") {
-      const malformedErr = new Error("Meta Responses API returned an invalid response object.");
-      (malformedErr as unknown as { status: number; statusCode: number }).status = 502;
-      (malformedErr as unknown as { status: number; statusCode: number }).statusCode = 502;
-      throw malformedErr;
-    }
-
-    const resObj = data as { id?: unknown; output?: unknown; status?: unknown; usage?: unknown };
-    const id = typeof resObj.id === "string" ? resObj.id : "";
-    const output = Array.isArray(resObj.output) ? (resObj.output as ResponseOutputItem[]) : [];
-
-    if (!id) {
-      const missingIdErr = new Error("Meta Responses API response missing 'id' field.");
-      (missingIdErr as unknown as { status: number; statusCode: number }).status = 502;
-      (missingIdErr as unknown as { status: number; statusCode: number }).statusCode = 502;
-      throw missingIdErr;
-    }
-
-    return {
-      id,
-      status: typeof resObj.status === "string" ? resObj.status : "completed",
-      output,
-      usage: resObj.usage as ResponsesApiResponse["usage"],
+      (error as unknown as { status: number; statusCode: number }).status = 504;
+      (error as unknown as { status: number; statusCode: number }).statusCode = 504;
+      return error;
     };
+
+    try {
+      let response: Response;
+      try {
+        response = await fetchFunc(endpoint, {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+            Authorization: `Bearer ${apiKey}`,
+          },
+          body: JSON.stringify(payload),
+          signal: controller.signal,
+        });
+      } catch (networkError) {
+        const isTimeout = timedOut ||
+          (networkError instanceof Error &&
+            (networkError.name === "TimeoutError" ||
+              networkError.name === "AbortError" ||
+              /timeout/i.test(networkError.message)));
+        if (isTimeout) throw timeoutError();
+
+        const baseMsg =
+          networkError instanceof Error ? networkError.message : "Unknown network error";
+        const netErr = new Error(
+          sanitizeErrorMessage(`Meta Responses API network request failed: ${baseMsg}`)
+        );
+        (netErr as unknown as { status: number; statusCode: number }).status = 503;
+        (netErr as unknown as { status: number; statusCode: number }).statusCode = 503;
+        throw netErr;
+      }
+
+      if (!response.ok) {
+        let errorBody = "";
+        try {
+          errorBody = await response.text();
+        } catch (bodyError) {
+          if (timedOut ||
+              (bodyError instanceof Error &&
+                (bodyError.name === "AbortError" ||
+                  bodyError.name === "TimeoutError" ||
+                  /timeout/i.test(bodyError.message)))) {
+            throw timeoutError();
+          }
+        }
+
+        if (response.status === 401) {
+          const authErr = new Error(
+            "Meta API authentication failed (401). Please check MODEL_API_KEY."
+          );
+          (authErr as unknown as { status: number; statusCode: number }).status = 401;
+          (authErr as unknown as { status: number; statusCode: number }).statusCode = 401;
+          throw authErr;
+        }
+        if (response.status === 429) {
+          const rateErr = new Error(
+            "Meta API rate limit exceeded (429). Please try again later."
+          );
+          (rateErr as unknown as { status: number; statusCode: number }).status = 429;
+          (rateErr as unknown as { status: number; statusCode: number }).statusCode = 429;
+          throw rateErr;
+        }
+
+        const statusText = response.statusText ? ` ${response.statusText}` : "";
+        const detailMsg = errorBody ? ` Details: ${errorBody}` : "";
+        const upstreamErr = new Error(
+          sanitizeErrorMessage(
+            `Meta Responses API error (${response.status}):${statusText || " Upstream failure"}${detailMsg}`
+          )
+        );
+        (upstreamErr as unknown as { status: number; statusCode: number }).status = response.status;
+        (upstreamErr as unknown as { status: number; statusCode: number }).statusCode = response.status;
+        throw upstreamErr;
+      }
+
+      let data: unknown;
+      try {
+        data = await response.json();
+      } catch (parseError) {
+        if (timedOut ||
+            (parseError instanceof Error &&
+              (parseError.name === "AbortError" ||
+                parseError.name === "TimeoutError" ||
+                /timeout/i.test(parseError.message)))) {
+          throw timeoutError();
+        }
+        const parseErr = new Error("Failed to parse JSON response from Meta Responses API.");
+        (parseErr as unknown as { status: number; statusCode: number }).status = 502;
+        (parseErr as unknown as { status: number; statusCode: number }).statusCode = 502;
+        throw parseErr;
+      }
+
+      if (!data || typeof data !== "object") {
+        const malformedErr = new Error("Meta Responses API returned an invalid response object.");
+        (malformedErr as unknown as { status: number; statusCode: number }).status = 502;
+        (malformedErr as unknown as { status: number; statusCode: number }).statusCode = 502;
+        throw malformedErr;
+      }
+
+      const resObj = data as { id?: unknown; output?: unknown; status?: unknown; usage?: unknown };
+      const id = typeof resObj.id === "string" ? resObj.id : "";
+      const output = Array.isArray(resObj.output) ? (resObj.output as ResponseOutputItem[]) : [];
+
+      if (!id) {
+        const missingIdErr = new Error("Meta Responses API response missing 'id' field.");
+        (missingIdErr as unknown as { status: number; statusCode: number }).status = 502;
+        (missingIdErr as unknown as { status: number; statusCode: number }).statusCode = 502;
+        throw missingIdErr;
+      }
+
+      return {
+        id,
+        status: typeof resObj.status === "string" ? resObj.status : "completed",
+        output,
+        usage: resObj.usage as ResponsesApiResponse["usage"],
+      };
+    } finally {
+      clearTimeout(timeout);
+    }
   }
 }
 

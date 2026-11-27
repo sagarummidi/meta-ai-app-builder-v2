@@ -1161,7 +1161,9 @@ export interface PipelineExecutionOptions {
     stageMessage: string,
     progressPercent: number,
     completedFiles: GeneratedFile[],
-    stageStatus?: GenerationJobStatus
+    stageStatus?: GenerationJobStatus,
+    pendingFiles?: PlannedFile[] | string[],
+    failedFiles?: { path: string; error?: string }[] | string[]
   ) => void;
 }
 
@@ -1174,6 +1176,9 @@ export interface PipelineExecutionResult {
   fallbackNotice?: string;
   attemptsUsed: number;
   timings: PipelineTimingInfo;
+  manifest?: PlannedFile[];
+  pendingFiles?: string[];
+  failedFiles?: string[];
 }
 
 /**
@@ -1626,8 +1631,158 @@ Return ONLY valid JSON:
 }
 
 export interface PlannedFile {
+  complexity?: "high" | "medium" | "low";
+  status?: "pending" | "generating" | "generated" | "failed";
+  attempts?: number;
+  error?: string;
   path: string;
   purpose: string;
+  module?: string;
+}
+
+export interface FeatureModule {
+  name: string;
+  description: string;
+  files?: PlannedFile[];
+  complexity?: "low" | "medium" | "high";
+}
+
+export interface HierarchicalPlan {
+  plan: string;
+  modules?: FeatureModule[];
+  files?: PlannedFile[];
+  dependencies?: Record<string, string>;
+}
+
+export type ProjectManifestFile = PlannedFile;
+
+export interface ProjectManifest {
+  planDescription: string;
+  files: PlannedFile[];
+  dependencies: Record<string, string>;
+  complexity: "simple" | "medium" | "complex";
+}
+
+export interface PromptAnalysisOptions {
+  maxManifestFiles?: number;
+  hierarchicalPlanning?: boolean;
+}
+
+export interface PromptAnalysis {
+  complexity: "simple" | "medium" | "complex";
+  isLargeApp: boolean;
+  estimatedFileCount: number;
+  maxManifestFiles: number;
+  suggestedBatchSize: number;
+  useHierarchicalPlanning: boolean;
+  reasons: string[];
+}
+
+export function analyzePromptComplexity(
+  userPrompt: string,
+  options?: PromptAnalysisOptions
+): PromptAnalysis {
+  const prompt = userPrompt || "";
+  const len = prompt.length;
+  const reasons: string[] = [];
+
+  const complexKeywords = [
+    "dashboard", "e-commerce", "ecommerce", "store", "marketplace",
+    "saas", "crm", "analytics", "admin", "management",
+    "multi-view", "multi-screen", "tabs", "navigation", "routes",
+    "workflow", "pipeline", "kanban", "calendar", "database",
+    "table", "sorting", "pagination", "modal", "drawer",
+    "authentication", "auth", "role-based", "checkout", "cart",
+    "telemetry", "metrics", "chart", "charts", "inventory",
+    "orders", "customers", "settings", "fleet", "cluster"
+  ];
+
+  let keywordMatches = 0;
+  const lower = prompt.toLowerCase();
+  for (const kw of complexKeywords) {
+    if (lower.includes(kw)) {
+      keywordMatches++;
+    }
+  }
+
+  const bulletCount = (prompt.match(/^(\s*[-*•]|\s*\d+\.)\s+/gm) || []).length;
+  const sectionCount = (prompt.match(/^#{1,4}\s+/gm) || []).length;
+
+  const explicitLargeFileMatch =
+    /(?:3[0-9]|4[0-9]|50)\s*files/i.test(prompt) ||
+    /(?:30\s*to\s*50|30-50)\s*files/i.test(prompt);
+
+  const massiveEnterpriseMatch =
+    /(?:enterprise|large[- ]scale|multi[- ]module|production[- ]grade)\s+(?:application|system|suite|platform)/i.test(prompt) &&
+    (keywordMatches >= 5 || bulletCount >= 6);
+
+  let complexity: "simple" | "medium" | "complex" = "simple";
+
+  if (explicitLargeFileMatch || massiveEnterpriseMatch || len > 1200 || keywordMatches >= 5 || bulletCount >= 6 || sectionCount >= 3) {
+    complexity = "complex";
+    reasons.push(`Prompt scale: length=${len}, keywords=${keywordMatches}, bullets=${bulletCount}, sections=${sectionCount}`);
+  } else if (len > 350 || keywordMatches >= 2 || bulletCount >= 3 || sectionCount >= 1) {
+    complexity = "medium";
+    reasons.push(`Medium scale: length=${len}, keywords=${keywordMatches}`);
+  } else {
+    reasons.push(`Simple scale: length=${len}`);
+  }
+
+  const isLargeApp = complexity === "complex";
+
+  let useHierarchicalPlanning = false;
+  let maxManifestFiles = complexity === "complex" ? 12 : complexity === "medium" ? 6 : 5;
+
+  if (explicitLargeFileMatch || massiveEnterpriseMatch) {
+    maxManifestFiles = 50;
+    useHierarchicalPlanning = true;
+    reasons.push("Detected 30-50 file or enterprise multi-module platform scale");
+  }
+
+  if (typeof options?.maxManifestFiles === "number" && options.maxManifestFiles > 0) {
+    maxManifestFiles = Math.min(50, Math.max(2, options.maxManifestFiles));
+    if (maxManifestFiles > 12) {
+      useHierarchicalPlanning = true;
+    }
+    reasons.push(`Configured maxManifestFiles override: ${maxManifestFiles}`);
+  }
+
+  if (options?.hierarchicalPlanning !== undefined) {
+    useHierarchicalPlanning = options.hierarchicalPlanning;
+  }
+
+  const estimatedFileCount =
+    maxManifestFiles >= 30 ? 35 : complexity === "complex" ? 6 : complexity === "medium" ? 3 : 2;
+  const suggestedBatchSize = 1;
+
+  return {
+    complexity,
+    isLargeApp,
+    estimatedFileCount,
+    maxManifestFiles,
+    suggestedBatchSize,
+    useHierarchicalPlanning,
+    reasons,
+  };
+}
+
+export function detectResponseTruncation(
+  response: { outputText?: string; finishReason?: string | null; truncated?: boolean },
+  parseResult?: ExtractedJsonResult<unknown>
+): { isTruncated: boolean; reason?: string } {
+  if (response.truncated === true) {
+    return { isTruncated: true, reason: "provider truncated flag" };
+  }
+  if (isFinishReasonTruncated(response.finishReason)) {
+    return { isTruncated: true, reason: `finishReason: ${response.finishReason}` };
+  }
+  if (parseResult?.isTruncated) {
+    return { isTruncated: true, reason: "json parser detected incomplete boundary" };
+  }
+  if (parseResult && !parseResult.success && parseResult.error && isTruncationError(parseResult.error)) {
+    return { isTruncated: true, reason: `truncation parse error: ${parseResult.error}` };
+  }
+  return { isTruncated: false };
 }
 
 export interface ApplicationPlan {
@@ -1779,9 +1934,19 @@ export interface StagedPipelineOptions {
     stageMessage: string,
     progressPercent: number,
     completedFiles: GeneratedFile[],
-    stageStatus?: GenerationJobStatus
+    stageStatus?: GenerationJobStatus,
+    pendingFiles?: PlannedFile[] | string[],
+    failedFiles?: { path: string; error?: string }[] | string[],
+    manifest?: PlannedFile[]
   ) => void;
   maxComponentRetries?: number;
+  batchSize?: number;
+  adaptiveBatching?: boolean;
+  initialFiles?: GeneratedFile[];
+  initialManifest?: PlannedFile[];
+  maxManifestFiles?: number;
+  hierarchicalPlanning?: boolean;
+  concurrency?: number;
 }
 
 /**
@@ -1807,6 +1972,13 @@ export async function executeStagedGenerationPipeline(
     timeoutMs = DEFAULT_PROVIDER_TIMEOUT_MS,
     onProgress,
     maxComponentRetries = 1,
+    batchSize,
+    adaptiveBatching = false,
+    initialFiles = [],
+    initialManifest = [],
+    maxManifestFiles,
+    hierarchicalPlanning,
+    concurrency,
   } = options;
 
   const startPipelineTime = Date.now();
@@ -1817,7 +1989,7 @@ export async function executeStagedGenerationPipeline(
   let syntaxValidationDurationMs = 0;
   let modelCallsCount = 0;
 
-  let accumulatedFiles: GeneratedFile[] = [];
+  let accumulatedFiles: GeneratedFile[] = initialFiles.length > 0 ? [...initialFiles] : [];
   const accumulatedDeps: Record<string, string> = {};
   let lastUsedModel = model;
   let lastUsedProvider = provider;
@@ -1893,10 +2065,126 @@ export async function executeStagedGenerationPipeline(
     return output;
   }
 
-  // --- STAGE 1: PLAN APPLICATION ARCHITECTURE ---
-  onProgress?.("Planning application architecture...", 10, accumulatedFiles, "planning");
+  // Analyze prompt scale & complexity with hierarchical planning support
+  const promptAnalysis = analyzePromptComplexity(userPrompt, {
+    maxManifestFiles,
+    hierarchicalPlanning,
+  });
 
-  const planPrompt = `Plan a React TypeScript application based on this request:
+  let plannedFiles: PlannedFile[] = [];
+  const failedFiles: { path: string; error: string; attempts: number }[] = [];
+
+  function getPendingFiles(): PlannedFile[] {
+    const completedPaths = new Set(accumulatedFiles.map((f) => f.path));
+    const failedPaths = new Set(failedFiles.map((f) => f.path));
+    return plannedFiles.filter(
+      (pf) => !completedPaths.has(pf.path) && !failedPaths.has(pf.path)
+    );
+  }
+
+  function emitProgress(
+    stageMessage: string,
+    progressPercent: number,
+    stageStatus?: GenerationJobStatus
+  ): void {
+    onProgress?.(
+      stageMessage,
+      progressPercent,
+      accumulatedFiles,
+      stageStatus,
+      getPendingFiles(),
+      failedFiles,
+      plannedFiles
+    );
+  }
+
+  // --- STAGE 1: PLAN APPLICATION ARCHITECTURE (Hierarchical Multi-Module Planning) ---
+  emitProgress("Planning application architecture...", 10, "planning");
+
+  if (initialManifest.length > 0) {
+    plannedFiles = [...initialManifest];
+    emitProgress(
+      `Loaded existing manifest (${plannedFiles.length} files planned)...`,
+      15,
+      "planning"
+    );
+  } else {
+    const isHierarchical =
+      promptAnalysis.useHierarchicalPlanning ||
+      hierarchicalPlanning ||
+      promptAnalysis.maxManifestFiles > 12;
+
+    const planPrompt = isHierarchical
+      ? `Analyze this large application request and create a hierarchical multi-module architectural plan for a modular React TypeScript application:
+"${userPrompt}"
+
+Plan between 4 and 8 functional feature modules (for example: Core/Shared, Auth/User, Navigation/Layout, Feature1, Feature2, Feature3, Analytics/Reporting, Settings/Admin).
+For each module, plan 4 to 8 focused, modular files (components, types, hooks, or utilities).
+Total planned files across all modules should be between 30 and ${promptAnalysis.maxManifestFiles} files.
+
+Requirements:
+1. Include shared type definitions ("types.ts" or "types/*.ts").
+2. Include modular UI components in organized subdirectories (e.g. "components/<module>/*.tsx").
+3. Include "App.tsx" as the root orchestrator connecting the modules.
+4. For each file, estimate complexity as "low", "medium", or "high".
+
+Return ONLY valid JSON matching this schema:
+{
+  "plan": "Description of the multi-module architecture",
+  "modules": [
+    {
+      "name": "core",
+      "description": "Shared models, types, and utility helpers",
+      "files": [
+        { "path": "types.ts", "purpose": "Domain data types and interfaces", "complexity": "low" },
+        { "path": "lib/utils.ts", "purpose": "Formatting and helper functions", "complexity": "low" }
+      ]
+    },
+    {
+      "name": "dashboard",
+      "description": "Dashboard overview and metric cards",
+      "files": [
+        { "path": "components/dashboard/MetricsGrid.tsx", "purpose": "KPI summary cards", "complexity": "medium" },
+        { "path": "components/dashboard/ActivityFeed.tsx", "purpose": "Recent activities list", "complexity": "medium" }
+      ]
+    }
+  ],
+  "files": [
+    { "path": "types.ts", "purpose": "Domain data types and interfaces", "complexity": "low" },
+    { "path": "lib/utils.ts", "purpose": "Formatting and helper functions", "complexity": "low" },
+    { "path": "components/dashboard/MetricsGrid.tsx", "purpose": "KPI summary cards", "complexity": "medium" },
+    { "path": "components/dashboard/ActivityFeed.tsx", "purpose": "Recent activities list", "complexity": "medium" },
+    { "path": "App.tsx", "purpose": "Root application orchestrator", "complexity": "high" }
+  ],
+  "dependencies": {
+    "lucide-react": "latest"
+  }
+}`
+      : promptAnalysis.isLargeApp
+      ? `Analyze this application request and plan a comprehensive, modular React TypeScript application:
+"${userPrompt}"
+
+Create a complete project manifest with all necessary files to fully satisfy the user's requirements:
+1. "types.ts" (domain models, interfaces, state types)
+2. Modular UI components (in "components/"), each with a single focused responsibility
+3. "App.tsx" (the main root application component that imports and connects them)
+
+Plan between 3 and ${promptAnalysis.maxManifestFiles} clean, modular files. For each file, estimate complexity as "low", "medium", or "high".
+
+Return ONLY valid JSON matching this schema:
+{
+  "plan": "Short description of the app design",
+  "files": [
+    { "path": "types.ts", "purpose": "Type definitions for data models", "complexity": "low" },
+    { "path": "components/Header.tsx", "purpose": "Navigation and controls", "complexity": "low" },
+    { "path": "components/DataView.tsx", "purpose": "Main data presentation", "complexity": "high" },
+    { "path": "App.tsx", "purpose": "Main application layout and state", "complexity": "high" }
+  ],
+  "dependencies": {
+    "lucide-react": "latest"
+  }
+}`
+      : `Plan a React TypeScript application based on this request:
 "${userPrompt}"
 
 Provide a clean, focused, modular architectural plan with 2 to 5 files:
@@ -1919,55 +2207,81 @@ Return ONLY valid JSON matching this schema:
   }
 }`;
 
-  let plannedFiles: PlannedFile[] = [];
+    try {
+      const planOutput = await invokeModel(planPrompt, "planning");
+      const parseStart = Date.now();
+      const parsedPlan = safeParseJson<HierarchicalPlan>(planOutput);
+      jsonParsingDurationMs += Date.now() - parseStart;
 
-  try {
-    const planOutput = await invokeModel(planPrompt, "planning");
-    const parseStart = Date.now();
-    const parsedPlan = safeParseJson<ApplicationPlan>(planOutput);
-    jsonParsingDurationMs += Date.now() - parseStart;
+      logGenerationStageDiagnostic({
+        requestId,
+        provider: lastUsedProvider,
+        model: lastUsedModel,
+        stage: "planning",
+        attempt: 1,
+        responseLength: planOutput.length,
+        isTruncated: parsedPlan.isTruncated,
+        jsonParseError: parsedPlan.error,
+        jsonParsePosition: parsedPlan.truncatedPosition,
+        recoveredFilesCount: 0,
+        jobStatus: "planning",
+      });
 
-    logGenerationStageDiagnostic({
-      requestId,
-      provider: lastUsedProvider,
-      model: lastUsedModel,
-      stage: "planning",
-      attempt: 1,
-      responseLength: planOutput.length,
-      isTruncated: parsedPlan.isTruncated,
-      jsonParseError: parsedPlan.error,
-      jsonParsePosition: parsedPlan.truncatedPosition,
-      recoveredFilesCount: 0,
-      jobStatus: "planning",
-    });
-
-    if (parsedPlan.success && parsedPlan.data?.files && Array.isArray(parsedPlan.data.files)) {
-      for (const item of parsedPlan.data.files) {
-        if (!item || typeof item.path !== "string") continue;
-        try {
-          const norm = normalizeWorkspacePath(item.path);
-          plannedFiles.push({
-            path: norm,
-            purpose: typeof item.purpose === "string" ? item.purpose : "Component",
-          });
-        } catch {
-          // ignore invalid path
+      if (parsedPlan.success && parsedPlan.data) {
+        if (Array.isArray(parsedPlan.data.modules)) {
+          for (const mod of parsedPlan.data.modules) {
+            if (mod && Array.isArray(mod.files)) {
+              for (const item of mod.files) {
+                if (!item || typeof item.path !== "string") continue;
+                try {
+                  const norm = normalizeWorkspacePath(item.path);
+                  plannedFiles.push({
+                    path: norm,
+                    purpose: typeof item.purpose === "string" ? item.purpose : `${mod.name} component`,
+                    complexity: item.complexity === "high" || item.complexity === "low" ? item.complexity : "medium",
+                    status: "pending",
+                    module: typeof mod.name === "string" ? mod.name : undefined,
+                  });
+                } catch {
+                  // ignore invalid path
+                }
+              }
+            }
+          }
         }
-      }
 
-      if (parsedPlan.data.dependencies && typeof parsedPlan.data.dependencies === "object") {
-        for (const [k, v] of Object.entries(parsedPlan.data.dependencies)) {
-          if (typeof k === "string" && /^[a-zA-Z0-9@_./-]+$/.test(k.trim())) {
-            accumulatedDeps[k.trim()] = typeof v === "string" ? v : "latest";
+        if (Array.isArray(parsedPlan.data.files)) {
+          for (const item of parsedPlan.data.files) {
+            if (!item || typeof item.path !== "string") continue;
+            try {
+              const norm = normalizeWorkspacePath(item.path);
+              plannedFiles.push({
+                path: norm,
+                purpose: typeof item.purpose === "string" ? item.purpose : "Component",
+                complexity: item.complexity === "high" || item.complexity === "low" ? item.complexity : "medium",
+                status: "pending",
+                module: typeof item.module === "string" ? item.module : undefined,
+              });
+            } catch {
+              // ignore invalid path
+            }
+          }
+        }
+
+        if (parsedPlan.data.dependencies && typeof parsedPlan.data.dependencies === "object") {
+          for (const [k, v] of Object.entries(parsedPlan.data.dependencies)) {
+            if (typeof k === "string" && /^[a-zA-Z0-9@_./-]+$/.test(k.trim())) {
+              accumulatedDeps[k.trim()] = typeof v === "string" ? v : "latest";
+            }
           }
         }
       }
+    } catch (planErr) {
+      if (!isRetryableModelError(planErr)) {
+        throw planErr;
+      }
+      console.warn(`[Req ${requestId}] Plan model call failed, falling back to default plan:`, planErr);
     }
-  } catch (planErr) {
-    if (!isRetryableModelError(planErr)) {
-      throw planErr;
-    }
-    console.warn(`[Req ${requestId}] Plan model call failed, falling back to default plan:`, planErr);
   }
 
   // Ensure App.tsx exists in planned files
@@ -1978,10 +2292,12 @@ Return ONLY valid JSON matching this schema:
     plannedFiles.push({
       path: "App.tsx",
       purpose: "Main root application entry point",
+      complexity: "high",
+      status: "pending",
     });
   }
 
-  // Deduplicate and cap at 5 files
+  // Deduplicate and cap according to prompt scale (up to 50 files for large applications)
   const seenPaths = new Set<string>();
   const uniquePlanned: PlannedFile[] = [];
   for (const pf of plannedFiles) {
@@ -1990,21 +2306,25 @@ Return ONLY valid JSON matching this schema:
       uniquePlanned.push(pf);
     }
   }
-  plannedFiles = uniquePlanned.slice(0, 5);
+  plannedFiles = uniquePlanned.slice(0, promptAnalysis.maxManifestFiles);
 
   // Group files: shared (types, utils, config), components, and entry point (App.tsx)
   const sharedFiles = plannedFiles.filter(
     (f) =>
       f.path !== "App.tsx" &&
+      !f.path.endsWith("/App.tsx") &&
       (f.path === "types.ts" ||
         f.path.includes("types") ||
         f.path.includes("util") ||
-        f.path.includes("config"))
+        f.path.includes("config") ||
+        f.path.includes("constants") ||
+        f.path.includes("helpers"))
   );
 
   const componentFiles = plannedFiles.filter(
     (f) =>
       f.path !== "App.tsx" &&
+      !f.path.endsWith("/App.tsx") &&
       !sharedFiles.some((sf) => sf.path === f.path)
   );
 
@@ -2015,9 +2335,16 @@ Return ONLY valid JSON matching this schema:
     checkPipelineDeadline("generating_shared");
     const file = sharedFiles[i];
     const progress = 20 + Math.round(((i + 1) / (sharedFiles.length + 1)) * 15);
-    onProgress?.(`Generating shared file: ${file.path}...`, progress, accumulatedFiles, "generating_shared");
 
-    const sharedPrompt = `Generate the following shared file for the React TypeScript application "${userPrompt}":
+    // Skip if already generated (resumable)
+    if (accumulatedFiles.some((f) => f.path === file.path)) {
+      emitProgress(`Skipping already completed shared file: ${file.path}`, progress, "generating_shared");
+      continue;
+    }
+
+    emitProgress(`Generating shared file: ${file.path}...`, progress, "generating_shared");
+
+    let sharedPrompt = `Generate the following shared file for the React TypeScript application "${userPrompt}":
 Path: "${file.path}"
 Purpose: "${file.purpose}"
 
@@ -2032,65 +2359,152 @@ Return ONLY valid JSON:
   "dependencies": {}
 }`;
 
-    try {
-      const output = await invokeModel(sharedPrompt, "generating_shared");
-      const parseStart = Date.now();
-      const parsed = safeParseJson<GenerationOutput>(output);
-      jsonParsingDurationMs += Date.now() - parseStart;
+    let fileSuccess = false;
+    let retries = 0;
 
-      logGenerationStageDiagnostic({
-        requestId,
-        provider: lastUsedProvider,
-        model: lastUsedModel,
-        stage: "generating_shared",
-        filePath: file.path,
-        attempt: 1,
-        responseLength: output.length,
-        isTruncated: parsed.isTruncated,
-        jsonParseError: parsed.error,
-        jsonParsePosition: parsed.truncatedPosition,
-        recoveredFilesCount: accumulatedFiles.length,
-        jobStatus: "generating_shared",
-      });
+    while (!fileSuccess && retries <= maxComponentRetries) {
+      checkPipelineDeadline("generating_shared");
+      try {
+        const output = await invokeModel(sharedPrompt, "generating_shared");
+        const parseStart = Date.now();
+        const parsed = safeParseJson<GenerationOutput>(output);
+        jsonParsingDurationMs += Date.now() - parseStart;
 
-      if (parsed.success && parsed.data?.files) {
-        const valStart = Date.now();
-        const validated = validateGenerationOutput(parsed.data);
-        syntaxValidationDurationMs += Date.now() - valStart;
+        logGenerationStageDiagnostic({
+          requestId,
+          provider: lastUsedProvider,
+          model: lastUsedModel,
+          stage: "generating_shared",
+          filePath: file.path,
+          attempt: retries + 1,
+          responseLength: output.length,
+          isTruncated: parsed.isTruncated,
+          jsonParseError: parsed.error,
+          jsonParsePosition: parsed.truncatedPosition,
+          recoveredFilesCount: accumulatedFiles.length,
+          jobStatus: "generating_shared",
+        });
 
-        if (validated.valid && validated.files && validated.files.length > 0) {
-          accumulatedFiles = mergeGeneratedFiles(accumulatedFiles, validated.files);
-          if (validated.dependencies) {
-            Object.assign(accumulatedDeps, validated.dependencies);
+        if (parsed.success && parsed.data?.files) {
+          const valStart = Date.now();
+          const validated = validateGenerationOutput(parsed.data);
+          syntaxValidationDurationMs += Date.now() - valStart;
+
+          if (validated.valid && validated.files && validated.files.length > 0) {
+            accumulatedFiles = mergeGeneratedFiles(accumulatedFiles, validated.files);
+            if (validated.dependencies) {
+              Object.assign(accumulatedDeps, validated.dependencies);
+            }
+            fileSuccess = true;
+            emitProgress(`Generated shared file: ${file.path}`, progress, "generating_shared");
           }
         }
-      } else {
-        const recovered = extractCompleteFilesFromTruncatedJson(output);
-        const fileRecovered = recovered.find((f) => f.path === file.path);
-        if (fileRecovered) {
-          accumulatedFiles = mergeGeneratedFiles(accumulatedFiles, [fileRecovered]);
+
+        if (!fileSuccess) {
+          const recovered = extractCompleteFilesFromTruncatedJson(output);
+          const fileRecovered = recovered.find((f) => f.path === file.path);
+          if (fileRecovered) {
+            accumulatedFiles = mergeGeneratedFiles(accumulatedFiles, [fileRecovered]);
+            fileSuccess = true;
+            emitProgress(`Recovered shared file: ${file.path}`, progress, "generating_shared");
+          }
+        }
+      } catch (sharedErr) {
+        console.warn(`[Req ${requestId}] Attempt ${retries + 1} for ${file.path} failed:`, sharedErr);
+        if (!isRetryableModelError(sharedErr)) {
+          break;
         }
       }
-    } catch (sharedErr) {
-      console.warn(`[Req ${requestId}] Failed to generate shared file ${file.path}:`, sharedErr);
+
+      if (!fileSuccess) {
+        retries++;
+        sharedPrompt = `The previous attempt for "${file.path}" was truncated or incomplete.
+Generate a concise, clean, working TypeScript file for "${file.path}" for "${userPrompt}".
+Keep code compact to ensure it stays well within output token limits.
+Return ONLY valid JSON:
+{
+  "files": [
+    {
+      "path": "${file.path}",
+      "code": "complete TypeScript code"
+    }
+  ],
+  "dependencies": {}
+}`;
+      }
+    }
+
+    if (!fileSuccess) {
+      failedFiles.push({ path: file.path, error: "Failed after retries", attempts: retries });
     }
   }
 
   checkPipelineDeadline("generating_shared");
 
-  // --- STAGE 3: GENERATE INDIVIDUAL COMPONENTS ---
+  // --- STAGE 3: GENERATE INDIVIDUAL COMPONENTS (Adaptive Batching, Bounded Concurrency & Per-File Generation) ---
   const sharedContext = accumulatedFiles
     .filter((f) => f.path.endsWith(".ts"))
     .map((f) => `// File: ${f.path}\n${f.code}`)
     .join("\n\n");
 
-  for (let i = 0; i < componentFiles.length; i++) {
-    checkPipelineDeadline("generating_components");
-    const comp = componentFiles[i];
-    const progress = 35 + Math.round(((i + 1) / (componentFiles.length + 1)) * 40);
-    onProgress?.(`Generating component: ${comp.path}...`, progress, accumulatedFiles, "generating_components");
+  let boundedConcurrency = Math.min(
+    2,
+    Math.max(
+      1,
+      typeof concurrency === "number"
+        ? concurrency
+        : adaptiveBatching && !promptAnalysis.isLargeApp
+        ? 2
+        : typeof batchSize === "number" && batchSize > 0
+        ? batchSize
+        : 1
+    )
+  );
 
-    let compPrompt = `Generate the component "${comp.path}" for the application "${userPrompt}".
+  let compIdx = 0;
+  while (compIdx < componentFiles.length) {
+    checkPipelineDeadline("generating_components");
+
+    // Check remaining deadline time: if under 15 seconds, pause safely for resumption
+    const remainingBeforeBatch = pipelineDeadline - Date.now();
+    if (remainingBeforeBatch < 15000 && accumulatedFiles.length > 0) {
+      const pendingCount = getPendingFiles().length;
+      const pauseErr = new Error(
+        `Application generation pipeline reached execution limit (${Math.round(timeoutMs / 60000)}m) during stage 'generating_components'. ` +
+        `Preserved ${accumulatedFiles.length} generated files. Call /api/generate with resumeJobId to continue generating remaining ${pendingCount} files.`
+      );
+      (pauseErr as unknown as { status: number; statusCode: number }).status = 504;
+      (pauseErr as unknown as { status: number; statusCode: number }).statusCode = 504;
+      throw pauseErr;
+    }
+
+    // Grab next batch of ungenerated components up to boundedConcurrency
+    const batchCandidates: PlannedFile[] = [];
+    while (
+      batchCandidates.length < boundedConcurrency &&
+      compIdx < componentFiles.length
+    ) {
+      const candidate = componentFiles[compIdx];
+      compIdx++;
+      if (!accumulatedFiles.some((f) => f.path === candidate.path)) {
+        batchCandidates.push(candidate);
+      }
+    }
+
+    if (batchCandidates.length === 0) continue;
+
+    const progress = 35 + Math.round((compIdx / (componentFiles.length + 1)) * 40);
+    const candidateNames = batchCandidates.map((c) => c.path).join(", ");
+    emitProgress(`Generating component: ${candidateNames}...`, progress, "generating_components");
+
+    // Process batch with bounded concurrency (up to 2 parallel model calls)
+    await Promise.all(
+      batchCandidates.map(async (comp) => {
+        let compSuccess = false;
+        let retries = 0;
+        let lastError: unknown;
+
+        let compPrompt = `Generate the component "${comp.path}" for the application "${userPrompt}".
 Purpose: "${comp.purpose}"
 
 ${sharedContext ? `Existing types and shared interfaces in the project:\n${sharedContext}\n` : ""}
@@ -2110,65 +2524,72 @@ Rules:
   "dependencies": {}
 }`;
 
-    let compSuccess = false;
-    let retries = 0;
+        while (!compSuccess && retries <= maxComponentRetries) {
+          checkPipelineDeadline("generating_components");
+          try {
+            const output = await invokeModel(compPrompt, "generating_components");
+            const parseStart = Date.now();
+            const parsed = safeParseJson<GenerationOutput>(output);
+            jsonParsingDurationMs += Date.now() - parseStart;
 
-    while (!compSuccess && retries <= maxComponentRetries) {
-      checkPipelineDeadline("generating_components");
-      try {
-        const output = await invokeModel(compPrompt, "generating_components");
-        const parseStart = Date.now();
-        const parsed = safeParseJson<GenerationOutput>(output);
-        jsonParsingDurationMs += Date.now() - parseStart;
+            logGenerationStageDiagnostic({
+              requestId,
+              provider: lastUsedProvider,
+              model: lastUsedModel,
+              stage: "generating_components",
+              filePath: comp.path,
+              attempt: retries + 1,
+              responseLength: output.length,
+              isTruncated: parsed.isTruncated,
+              jsonParseError: parsed.error,
+              jsonParsePosition: parsed.truncatedPosition,
+              recoveredFilesCount: accumulatedFiles.length,
+              jobStatus: "generating_components",
+            });
 
-        logGenerationStageDiagnostic({
-          requestId,
-          provider: lastUsedProvider,
-          model: lastUsedModel,
-          stage: "generating_components",
-          filePath: comp.path,
-          attempt: retries + 1,
-          responseLength: output.length,
-          isTruncated: parsed.isTruncated,
-          jsonParseError: parsed.error,
-          jsonParsePosition: parsed.truncatedPosition,
-          recoveredFilesCount: accumulatedFiles.length,
-          jobStatus: "generating_components",
-        });
+            if (parsed.success && parsed.data?.files) {
+              const valStart = Date.now();
+              const validated = validateGenerationOutput(parsed.data);
+              syntaxValidationDurationMs += Date.now() - valStart;
 
-        if (parsed.success && parsed.data?.files) {
-          const valStart = Date.now();
-          const validated = validateGenerationOutput(parsed.data);
-          syntaxValidationDurationMs += Date.now() - valStart;
-
-          if (validated.valid && validated.files && validated.files.length > 0) {
-            accumulatedFiles = mergeGeneratedFiles(accumulatedFiles, validated.files);
-            if (validated.dependencies) {
-              Object.assign(accumulatedDeps, validated.dependencies);
+              if (validated.valid && validated.files && validated.files.length > 0) {
+                accumulatedFiles = mergeGeneratedFiles(accumulatedFiles, validated.files);
+                if (validated.dependencies) {
+                  Object.assign(accumulatedDeps, validated.dependencies);
+                }
+                compSuccess = true;
+                emitProgress(`Generated component: ${comp.path}`, progress, "generating_components");
+              }
             }
-            compSuccess = true;
-          }
-        }
 
-        if (!compSuccess) {
-          // Check if partial file extraction works
-          const recovered = extractCompleteFilesFromTruncatedJson(output);
-          const compRecovered = recovered.find((f) => f.path === comp.path);
-          if (compRecovered) {
-            accumulatedFiles = mergeGeneratedFiles(accumulatedFiles, [compRecovered]);
-            compSuccess = true;
-          }
-        }
-      } catch (err) {
-        console.warn(`[Req ${requestId}] Attempt ${retries + 1} for ${comp.path} failed:`, err);
-        if (!isRetryableModelError(err)) {
-          break;
-        }
-      }
+            if (!compSuccess) {
+              const recovered = extractCompleteFilesFromTruncatedJson(output);
+              const compRecovered = recovered.find((f) => f.path === comp.path);
+              if (compRecovered) {
+                accumulatedFiles = mergeGeneratedFiles(accumulatedFiles, [compRecovered]);
+                compSuccess = true;
+                emitProgress(`Recovered component: ${comp.path}`, progress, "generating_components");
+              }
+            }
+          } catch (err) {
+            lastError = err;
+            const isRateLimit =
+              (err as { status?: number; statusCode?: number })?.status === 429 ||
+              (err as { status?: number; statusCode?: number })?.statusCode === 429;
 
-      if (!compSuccess) {
-        retries++;
-        compPrompt = `The previous attempt for "${comp.path}" was truncated or invalid.
+            if (isRateLimit) {
+              console.warn(`[Req ${requestId}] Rate limit (429) hit during ${comp.path}. Throttling concurrency to 1.`);
+              boundedConcurrency = 1;
+              const retryAfter = (err as { retryAfter?: number })?.retryAfter ?? 2;
+              await new Promise((r) => setTimeout(r, retryAfter * 1000));
+            } else if (!isRetryableModelError(err)) {
+              break;
+            }
+          }
+
+          if (!compSuccess) {
+            retries++;
+            compPrompt = `The previous attempt for "${comp.path}" was truncated or invalid.
 Generate a concise, clean, working implementation of "${comp.path}" for "${userPrompt}".
 Keep code compact to ensure it stays well within output token limits.
 Return ONLY valid JSON:
@@ -2181,29 +2602,50 @@ Return ONLY valid JSON:
   ],
   "dependencies": {}
 }`;
-      }
-    }
+          }
+        }
+
+        if (!compSuccess) {
+          failedFiles.push({
+            path: comp.path,
+            error: lastError ? String(lastError) : "Failed after retries",
+            attempts: retries,
+          });
+        }
+      })
+    );
   }
 
   checkPipelineDeadline("generating_components");
 
   // --- STAGE 4: GENERATE MAIN APPLICATION ENTRY POINT (App.tsx) ---
-  onProgress?.("Generating main application entry point (App.tsx)...", 80, accumulatedFiles, "generating_entry");
+  const existingApp = accumulatedFiles.find(
+    (f) => f.path === "App.tsx" || f.path.endsWith("/App.tsx")
+  );
+  const shouldSkipApp =
+    existingApp &&
+    failedFiles.length === 0 &&
+    initialFiles.some((f) => f.path === "App.tsx" || f.path.endsWith("/App.tsx"));
 
-  const availableFilesSummary = accumulatedFiles
-    .filter((f) => f.path !== "App.tsx")
-    .map((f) => `- ${f.path}`)
-    .join("\n");
+  if (shouldSkipApp) {
+    emitProgress("Reusing existing entry point (App.tsx)...", 85, "generating_entry");
+  } else {
+    emitProgress("Generating main application entry point (App.tsx)...", 80, "generating_entry");
 
-  const typesFile = accumulatedFiles.find((f) => f.path === "types.ts");
-  const typesSummary =
-    typesFile && typesFile.code.length < 2500
-      ? `\nType definitions:\n${typesFile.code}\n`
-      : "";
+    const availableFilesSummary = accumulatedFiles
+      .filter((f) => f.path !== "App.tsx")
+      .map((f) => `- ${f.path}`)
+      .join("\n");
 
-  const compactReqs = extractCompactRequirements(userPrompt);
+    const typesFile = accumulatedFiles.find((f) => f.path === "types.ts");
+    const typesSummary =
+      typesFile && typesFile.code.length < 2500
+        ? `\nType definitions:\n${typesFile.code}\n`
+        : "";
 
-  const baseAppPrompt = `Generate the main application file "App.tsx" that coordinates the application:
+    const compactReqs = extractCompactRequirements(userPrompt);
+
+    const baseAppPrompt = `Generate the main application file "App.tsx" that coordinates the application:
 
 ${compactReqs}
 
@@ -2229,20 +2671,20 @@ Rules:
   "dependencies": {}
 }`;
 
-  let currentAppPrompt = baseAppPrompt;
-  let appGenerated = false;
-  let appRetries = 0;
-  let lastAppError = "";
-  let lastAppStatusCode = 502;
-  const maxAppRetries = typeof maxComponentRetries === "number" && maxComponentRetries >= 0 ? maxComponentRetries : 1;
+    let currentAppPrompt = baseAppPrompt;
+    let appGenerated = false;
+    let appRetries = 0;
+    let lastAppError = "";
+    let lastAppStatusCode = 502;
+    const maxAppRetries = typeof maxComponentRetries === "number" && maxComponentRetries >= 0 ? maxComponentRetries : 1;
 
-  while (!appGenerated && appRetries <= maxAppRetries) {
-    checkPipelineDeadline("generating_entry");
+    while (!appGenerated && appRetries <= maxAppRetries) {
+      checkPipelineDeadline("generating_entry");
 
-    if (appRetries > 0) {
-      await new Promise((resolve) => setTimeout(resolve, 300 * appRetries));
+      if (appRetries > 0) {
+        await new Promise((resolve) => setTimeout(resolve, 300 * appRetries));
 
-      currentAppPrompt = `The previous attempt for App.tsx was truncated or incomplete.
+        currentAppPrompt = `The previous attempt for App.tsx was truncated or incomplete.
 Generate a clean, compact "App.tsx" orchestrator that connects the application components according to these requirements:
 
 ${compactReqs}
@@ -2265,106 +2707,108 @@ Rules:
   ],
   "dependencies": {}
 }`;
-    }
+      }
 
-    try {
-      const output = await invokeModel(currentAppPrompt, "generating_entry");
-      const parseStart = Date.now();
-      const parsed = safeParseJson<GenerationOutput>(output);
-      jsonParsingDurationMs += Date.now() - parseStart;
+      try {
+        const output = await invokeModel(currentAppPrompt, "generating_entry");
+        const parseStart = Date.now();
+        const parsed = safeParseJson<GenerationOutput>(output);
+        jsonParsingDurationMs += Date.now() - parseStart;
 
-      logGenerationStageDiagnostic({
-        requestId,
-        provider: lastUsedProvider,
-        model: lastUsedModel,
-        stage: "generating_entry",
-        filePath: "App.tsx",
-        attempt: appRetries + 1,
-        responseLength: output.length,
-        isTruncated: parsed.isTruncated,
-        jsonParseError: parsed.error,
-        jsonParsePosition: parsed.truncatedPosition,
-        recoveredFilesCount: accumulatedFiles.length,
-        incompleteFiles: parsed.isTruncated ? ["App.tsx"] : undefined,
-        jobStatus: "generating_entry",
-      });
+        logGenerationStageDiagnostic({
+          requestId,
+          provider: lastUsedProvider,
+          model: lastUsedModel,
+          stage: "generating_entry",
+          filePath: "App.tsx",
+          attempt: appRetries + 1,
+          responseLength: output.length,
+          isTruncated: parsed.isTruncated,
+          jsonParseError: parsed.error,
+          jsonParsePosition: parsed.truncatedPosition,
+          recoveredFilesCount: accumulatedFiles.length,
+          incompleteFiles: parsed.isTruncated ? ["App.tsx"] : undefined,
+          jobStatus: "generating_entry",
+        });
 
-      if (parsed.success && parsed.data?.files) {
-        const valStart = Date.now();
-        const validated = validateGenerationOutput(parsed.data);
-        syntaxValidationDurationMs += Date.now() - valStart;
+        if (parsed.success && parsed.data?.files) {
+          const valStart = Date.now();
+          const validated = validateGenerationOutput(parsed.data);
+          syntaxValidationDurationMs += Date.now() - valStart;
 
-        if (validated.valid && validated.files && validated.files.length > 0) {
-          accumulatedFiles = mergeGeneratedFiles(accumulatedFiles, validated.files);
-          if (validated.dependencies) {
-            Object.assign(accumulatedDeps, validated.dependencies);
+          if (validated.valid && validated.files && validated.files.length > 0) {
+            accumulatedFiles = mergeGeneratedFiles(accumulatedFiles, validated.files);
+            if (validated.dependencies) {
+              Object.assign(accumulatedDeps, validated.dependencies);
+            }
+            appGenerated = true;
+            emitProgress("Generated main application entry point (App.tsx)", 85, "generating_entry");
+          } else if (validated.error) {
+            lastAppError = validated.error;
+            lastAppStatusCode = 502;
           }
-          appGenerated = true;
-        } else if (validated.error) {
-          lastAppError = validated.error;
+        } else if (!parsed.success && parsed.error) {
+          lastAppError = parsed.error;
           lastAppStatusCode = 502;
         }
-      } else if (!parsed.success && parsed.error) {
-        lastAppError = parsed.error;
-        lastAppStatusCode = 502;
-      }
 
-      if (!appGenerated) {
-        const recovered = extractCompleteFilesFromTruncatedJson(output);
-        const appRecovered = recovered.find(
-          (f) => f.path === "App.tsx" || f.path.endsWith("/App.tsx")
-        );
-        if (appRecovered) {
-          accumulatedFiles = mergeGeneratedFiles(accumulatedFiles, [appRecovered]);
-          appGenerated = true;
+        if (!appGenerated) {
+          const recovered = extractCompleteFilesFromTruncatedJson(output);
+          const appRecovered = recovered.find(
+            (f) => f.path === "App.tsx" || f.path.endsWith("/App.tsx")
+          );
+          if (appRecovered) {
+            accumulatedFiles = mergeGeneratedFiles(accumulatedFiles, [appRecovered]);
+            appGenerated = true;
+            emitProgress("Recovered main application entry point (App.tsx)", 85, "generating_entry");
+          }
+        }
+      } catch (err) {
+        console.warn(`[Req ${requestId}] App.tsx generation attempt ${appRetries + 1} failed:`, err);
+        const errMsg = err instanceof Error ? err.message : String(err);
+        if (!lastAppError || !lastAppError.toLowerCase().includes("invalid typescript")) {
+          lastAppError = errMsg;
+        }
+        lastAppStatusCode =
+          (err as { status?: number; statusCode?: number })?.status ||
+          (err as { status?: number; statusCode?: number })?.statusCode ||
+          502;
+
+        if (!isRetryableModelError(err)) {
+          break;
         }
       }
-    } catch (err) {
-      console.warn(`[Req ${requestId}] App.tsx generation attempt ${appRetries + 1} failed:`, err);
-      const errMsg = err instanceof Error ? err.message : String(err);
-      if (!lastAppError || !lastAppError.toLowerCase().includes("invalid typescript")) {
-        lastAppError = errMsg;
-      }
-      lastAppStatusCode =
-        (err as { status?: number; statusCode?: number })?.status ||
-        (err as { status?: number; statusCode?: number })?.statusCode ||
-        502;
-
-      if (!isRetryableModelError(err)) {
-        break;
-      }
+      appRetries++;
     }
-    appRetries++;
-  }
 
-  if (!accumulatedFiles.some((f) => f.path === "App.tsx" || f.path.endsWith("/App.tsx"))) {
-    const sanitizedReason = lastAppError
-      ? (isTruncationError(lastAppError)
-          ? "model response was truncated due to output token limits"
-          : lastAppError)
-      : "model failed to produce a valid App.tsx";
-    const finalErr = new Error(
-      `Meta Muse Spark generation failed at stage 'generating_entry' (App.tsx): ${sanitizedReason}.`
-    );
-    (finalErr as unknown as { status: number; statusCode: number }).status = lastAppStatusCode || 502;
-    (finalErr as unknown as { status: number; statusCode: number }).statusCode = lastAppStatusCode || 502;
-    throw finalErr;
+    if (!accumulatedFiles.some((f) => f.path === "App.tsx" || f.path.endsWith("/App.tsx"))) {
+      const sanitizedReason = lastAppError
+        ? (isTruncationError(lastAppError)
+            ? "model response was truncated due to output token limits"
+            : lastAppError)
+        : "model failed to produce a valid App.tsx";
+      const finalErr = new Error(
+        `Meta Muse Spark generation failed at stage 'generating_entry' (App.tsx): ${sanitizedReason}.`
+      );
+      (finalErr as unknown as { status: number; statusCode: number }).status = lastAppStatusCode || 502;
+      (finalErr as unknown as { status: number; statusCode: number }).statusCode = lastAppStatusCode || 502;
+      throw finalErr;
+    }
   }
 
   checkPipelineDeadline("generating_entry");
 
-  // --- STAGE 5: VALIDATE & REPAIR MISSING IMPORTS ---
-  onProgress?.("Validating application syntax and relative imports...", 90, accumulatedFiles, "validating");
+  // --- STAGE 5: COMPLETE PROJECT VALIDATION & AUTO-REPAIR ---
+  emitProgress("Validating application syntax and relative imports...", 90, "validating");
 
   const missingImports = findMissingLocalImports(accumulatedFiles);
   if (missingImports.length > 0) {
-    const toRepair = missingImports.slice(0, 2);
+    const toRepair = missingImports.slice(0, 4); // Handle up to 4 missing imports for large apps
     for (const missing of toRepair) {
       checkPipelineDeadline("recovering");
-      onProgress?.(
+      emitProgress(
         `Generating missing component: ${missing.missingPath}...`,
         95,
-        accumulatedFiles,
         "recovering"
       );
 
@@ -2420,8 +2864,51 @@ Return ONLY valid JSON:
 
   // Final syntax verification
   const finalValStart = Date.now();
-  const finalSyntaxErr = findFirstSyntaxError(accumulatedFiles);
+  let finalSyntaxErr = findFirstSyntaxError(accumulatedFiles);
   syntaxValidationDurationMs += Date.now() - finalValStart;
+
+  if (finalSyntaxErr) {
+    // Attempt single-turn targeted self-repair if time permits
+    const remainingTimeMs = pipelineDeadline - Date.now();
+    if (remainingTimeMs > 5000) {
+      const brokenFile = accumulatedFiles.find((f) => {
+        const err = findSyntaxError(f.path, f.code);
+        return err !== null;
+      });
+
+      if (brokenFile) {
+        try {
+          const repairPrompt = `Fix the syntax error in "${brokenFile.path}":
+Error: ${finalSyntaxErr}
+
+Broken Code:
+${brokenFile.code}
+
+Return ONLY valid JSON:
+{
+  "files": [
+    {
+      "path": "${brokenFile.path}",
+      "code": "fixed complete React TypeScript code"
+    }
+  ],
+  "dependencies": {}
+}`;
+          const repairOut = await invokeModel(repairPrompt, "validating");
+          const parsedRepair = safeParseJson<GenerationOutput>(repairOut);
+          if (parsedRepair.success && parsedRepair.data?.files) {
+            const valRep = validateGenerationOutput(parsedRepair.data);
+            if (valRep.valid && valRep.files) {
+              accumulatedFiles = mergeGeneratedFiles(accumulatedFiles, valRep.files);
+              finalSyntaxErr = findFirstSyntaxError(accumulatedFiles);
+            }
+          }
+        } catch {
+          // If targeted repair fails, fallback to standard error
+        }
+      }
+    }
+  }
 
   if (finalSyntaxErr) {
     const synErr = new Error(
@@ -2432,7 +2919,7 @@ Return ONLY valid JSON:
     throw synErr;
   }
 
-  onProgress?.("Application generation completed successfully.", 100, accumulatedFiles, "completed");
+  emitProgress("Application generation completed successfully.", 100, "completed");
 
   const totalDurationMs = Date.now() - startPipelineTime;
   const timings: PipelineTimingInfo = {
@@ -2465,5 +2952,8 @@ Return ONLY valid JSON:
     fallbackNotice,
     attemptsUsed: modelCallsCount,
     timings,
+    manifest: plannedFiles,
+    pendingFiles: getPendingFiles().map((f) => f.path),
+    failedFiles: failedFiles.map((f) => f.path),
   };
 }
