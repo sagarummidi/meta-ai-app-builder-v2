@@ -608,7 +608,7 @@ export class PostgresJobStore implements IGenerationJobStore {
 
       if (isActive && (isOverMaxDuration || isStale)) {
         const errorMsg = isOverMaxDuration
-          ? "Generation job exceeded maximum execution time (10m). Upstream model took too long to complete."
+          ? "Generation job exceeded maximum execution time (15m). Upstream model took too long to complete."
           : `Generation job was interrupted by a server restart. Preserved ${job.partialFiles?.length || 0} generated files. Use resumeJobId to continue generating remaining ${job.pendingFilePaths?.length || 0} files.`;
 
         job = (await this.failJob(id, errorMsg, 504)) || job;
@@ -1010,7 +1010,7 @@ export class GenerationJobStoreManager implements IGenerationJobStore {
       if (isActive && isOverMaxDuration) {
         cached.status = "failed";
         cached.statusCode = 504;
-        cached.error = "Generation job exceeded maximum execution time (10m). Upstream model took too long to complete.";
+        cached.error = "Generation job exceeded maximum execution time (15m). Upstream model took too long to complete.";
       }
       return cached;
     }
