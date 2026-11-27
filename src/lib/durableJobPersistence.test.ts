@@ -277,7 +277,7 @@ describe("Phase 3: Durable Generation Job Persistence", () => {
     const previous = new Map(keys.map((key) => [key, process.env[key]]));
 
     try {
-      process.env.NODE_ENV = "production";
+      (process.env as any).NODE_ENV = "production";
       delete process.env.DATABASE_URL;
       delete process.env.POSTGRES_URL;
 
@@ -298,7 +298,7 @@ describe("Phase 3: Durable Generation Job Persistence", () => {
       for (const key of keys) {
         const value = previous.get(key);
         if (value === undefined) delete process.env[key];
-        else process.env[key] = value;
+        else (process.env as any)[key] = value;
       }
     }
   });
