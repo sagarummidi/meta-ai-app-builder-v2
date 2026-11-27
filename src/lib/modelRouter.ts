@@ -165,7 +165,7 @@ export interface ModelProvider {
   generate(request: ModelRequest): Promise<ModelResponse>;
 }
 
-export const MAX_GENERATION_DURATION_MS = 10 * 60 * 1000; // 10 minutes (600,000 ms)
+export const MAX_GENERATION_DURATION_MS = 15 * 60 * 1000; // 15 minutes (900,000 ms)
 export const DEFAULT_PROVIDER_TIMEOUT_MS = MAX_GENERATION_DURATION_MS;
 
 export function resolveProviderTimeoutMs(): number {
