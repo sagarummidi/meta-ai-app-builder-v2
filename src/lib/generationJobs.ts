@@ -918,6 +918,31 @@ export class PostgresJobStore implements IGenerationJobStore {
   }
 }
 
+/**
+ * Keeps the application and API routes loadable when production database
+ * configuration is missing or invalid. Job operations still fail explicitly;
+ * production never silently falls back to non-durable in-memory jobs.
+ */
+class UnavailableJobStore implements IGenerationJobStore {
+  constructor(private readonly reason: string) {}
+
+  private fail(): never {
+    throw new Error(this.reason);
+  }
+
+  createJob(): GenerationJob { return this.fail(); }
+  getJob(): GenerationJob | undefined { return this.fail(); }
+  updateJobProgress(): GenerationJob | undefined { return this.fail(); }
+  completeJob(): GenerationJob | undefined { return this.fail(); }
+  failJob(): GenerationJob | undefined { return this.fail(); }
+  async acquireResumeLock(): Promise<boolean> { return this.fail(); }
+  async releaseResumeLock(): Promise<void> { return this.fail(); }
+  async touchJob(): Promise<boolean> { return this.fail(); }
+  async renewResumeLock(): Promise<boolean> { return this.fail(); }
+  async cleanupExpiredJobs(): Promise<number> { return this.fail(); }
+  clear(): void { return this.fail(); }
+}
+
 // -----------------------------------------------------------------------------
 // Generation Job Store Manager (Unified Singleton Interface)
 // -----------------------------------------------------------------------------
@@ -943,7 +968,10 @@ export class GenerationJobStoreManager implements IGenerationJobStore {
         return new PostgresJobStore();
       } catch (err) {
         if (isProd && !isBuildPhase) {
-          throw err;
+          const detail = sanitizeErrorMessage(
+            err instanceof Error ? err.message : "Unknown database initialization error."
+          );
+          return new UnavailableJobStore("Production database initialization failed: " + detail);
         }
         console.warn("[JobStore] Failed to initialize PostgresJobStore, falling back to MemoryJobStore for dev/test:", err);
         return new MemoryJobStore();
@@ -951,8 +979,8 @@ export class GenerationJobStoreManager implements IGenerationJobStore {
     }
 
     if (isProd && !isBuildPhase) {
-      throw new Error(
-        "Production database configuration missing: Set DATABASE_URL or POSTGRES_URL to enable durable multi-instance generation job persistence."
+      return new UnavailableJobStore(
+        "Production database configuration missing: set DATABASE_URL or POSTGRES_URL to enable durable generation jobs."
       );
     }
 

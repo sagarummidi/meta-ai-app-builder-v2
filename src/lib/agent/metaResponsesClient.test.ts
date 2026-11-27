@@ -103,6 +103,34 @@ describe("Meta Responses API: Request Construction & Authentication", () => {
   });
 });
 
+describe("Meta Responses API timeout handling", () => {
+  test("maps a configured request timeout to HTTP 504", async () => {
+    const mockFetch = (async (_url: string | URL | Request, init?: RequestInit) => {
+      const signal = init?.signal;
+      return new Promise<Response>((_resolve, reject) => {
+        if (!signal) return reject(new Error("Missing abort signal"));
+        if (signal.aborted) return reject(signal.reason);
+        signal.addEventListener("abort", () => reject(signal.reason), { once: true });
+      });
+    }) as unknown as typeof fetch;
+
+    const client = new MetaResponsesClient({
+      apiKey: "timeout-test-key",
+      fetchFn: mockFetch,
+      timeoutMs: 20,
+    });
+    await assert.rejects(
+      () => client.sendResponseRequest({ model: "muse-spark-1.3", input: "test" }),
+      (error: Error & { status?: number; statusCode?: number }) => {
+        assert.equal(error.status, 504);
+        assert.equal(error.statusCode, 504);
+        assert.match(error.message, /timed out/i);
+        return true;
+      }
+    );
+  });
+});
+
 describe("Meta Responses API: Tool-Call Parsing & Execution", () => {
   test("successfully executes update_file tool call and resolves syntax errors", async () => {
     const brokenCode = `export default function App() {

@@ -20,7 +20,7 @@ Rapid application prototyping with Large Language Models typically suffers from 
 **Meta AI App Builder** bridges the gap between natural language prompts and live running applications using a specialized Meta-powered architecture:
 
 - **End-to-End Multi-File Generation**: Decomposes requests into planned modular architectures (`App.tsx`, shared types, modular UI components).
-- **Muse Spark Truncation Recovery**: Detects output truncation (`finish_reason: "length"`), preserves completed files, and executes targeted Stage 4 continuations using compact requirements extraction.
+- **Muse Spark Truncation Recovery**: Uses Meta Chat Completions streaming for long generations, detects output truncation (`finish_reason: "length"`), preserves completed files, and executes targeted continuations using compact requirements extraction.
 - **Dedicated Live Application Preview**: Runs bundled React applications client-side in an isolated, preview-only Sandpack container powered by local `/sandpack` bundler assets.
 - **Natural Language Workspace Edits**: Iteratively modifies existing code files via natural language instructions.
 - **User-Triggered Syntax Self-Repair**: Uses the official TypeScript Compiler API (`ts.getSyntacticDiagnostics`) to detect syntax flaws and automatically repairs them with Meta Muse Spark in a bounded 2-attempt loop.

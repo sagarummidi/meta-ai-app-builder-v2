@@ -14,6 +14,21 @@ export interface MetaResponsesClientConfig {
   baseUrl?: string;
   apiKey?: string;
   fetchFn?: typeof fetch;
+  timeoutMs?: number;
+}
+
+export const DEFAULT_META_AGENT_TIMEOUT_MS = 120_000;
+export const MAX_META_AGENT_TIMEOUT_MS = 180_000;
+
+export function resolveMetaAgentTimeoutMs(configuredTimeoutMs?: number): number {
+  const envTimeout = Number(process.env.META_AGENT_TIMEOUT_MS);
+  const candidate = configuredTimeoutMs ?? (
+    Number.isFinite(envTimeout) && envTimeout > 0
+      ? envTimeout
+      : DEFAULT_META_AGENT_TIMEOUT_MS
+  );
+  if (!Number.isFinite(candidate) || candidate <= 0) return DEFAULT_META_AGENT_TIMEOUT_MS;
+  return Math.min(Math.floor(candidate), MAX_META_AGENT_TIMEOUT_MS);
 }
 
 export interface ResponsesToolFunction {
@@ -183,9 +198,22 @@ export class MetaResponsesClient {
           Authorization: `Bearer ${apiKey}`,
         },
         body: JSON.stringify(payload),
-        signal: AbortSignal.timeout(90000),
+        signal: AbortSignal.timeout(resolveMetaAgentTimeoutMs(this.config?.timeoutMs)),
       });
     } catch (networkError) {
+      const isTimeout = networkError instanceof Error &&
+        (networkError.name === "TimeoutError" ||
+          networkError.name === "AbortError" ||
+          /timeout/i.test(networkError.message));
+      if (isTimeout) {
+        const timeoutErr = new Error(
+          "Meta Responses API request timed out after " +
+            Math.round(resolveMetaAgentTimeoutMs(this.config?.timeoutMs) / 1000) + "s."
+        );
+        (timeoutErr as unknown as { status: number; statusCode: number }).status = 504;
+        (timeoutErr as unknown as { status: number; statusCode: number }).statusCode = 504;
+        throw timeoutErr;
+      }
       const baseMsg =
         networkError instanceof Error ? networkError.message : "Unknown network error";
       const netErr = new Error(
