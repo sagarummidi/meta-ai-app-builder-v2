@@ -34,8 +34,8 @@ MODEL_API_KEY=your_meta_api_key_here
 # Optional: Meta API Base URL override (defaults to https://api.meta.ai/v1)
 # META_BASE_URL=https://api.meta.ai/v1
 
-# Optional: Request Timeout in milliseconds (defaults to 600000 = 10 minutes)
-# META_TIMEOUT_MS=600000
+# Optional: Request Timeout in milliseconds (defaults to 900000 = 15 minutes)
+# META_TIMEOUT_MS=900000
 ```
 
 > [!SECURITY]

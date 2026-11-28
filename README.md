@@ -181,7 +181,7 @@ flowchart TD
 | `AI_PROVIDER` | No | `meta` | AI provider identifier (strictly `meta`) |
 | `MODEL_API_KEY` | **Yes** | *None* | Server-side Meta API key for model authentication |
 | `META_BASE_URL` | No | `https://api.meta.ai/v1` | Custom Meta API base URL override |
-| `META_TIMEOUT_MS` | No | `600000` (10 min) | Upstream request timeout in milliseconds |
+| `META_TIMEOUT_MS` | No | `900000` (15 min) | Upstream request timeout in milliseconds |
 | `RATE_LIMIT_GENERATE_MAX` | No | `5` | Max generation requests per IP per window |
 | `RATE_LIMIT_EDIT_MAX` | No | `10` | Max edit requests per IP per window |
 | `RATE_LIMIT_AGENT_MAX` | No | `20` | Max syntax repair requests per IP per window |

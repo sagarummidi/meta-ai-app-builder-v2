@@ -22,7 +22,7 @@ import {
   type GenerationJobStatus,
 } from "@/lib/generationJobs";
 
-export const maxDuration = 600;
+export const maxDuration = 900;
 export const dynamic = "force-dynamic";
 
 const MAX_PROMPT_LENGTH = 15000;
